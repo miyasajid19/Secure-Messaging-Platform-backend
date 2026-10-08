@@ -1,9 +1,9 @@
 """FastAPI entrypoint.
 
-Phase 0/1 scope: a /health endpoint that also reports row counts so the
-supervisor (and `curl`) can confirm the seed ran. CORS is wired up so the
-Next.js dev server (localhost:3000) can call us without preflight failures
-later.
+Phase 0/1/2 scope: a /health endpoint that reports row counts, a /auth/*
+router for mocked-OTP login + JWT + protected profile, and a / root for
+process-up sanity checks. CORS is wired up so the Next.js dev server
+(localhost:3000) can call us without preflight failures later.
 """
 
 from contextlib import asynccontextmanager
@@ -11,15 +11,13 @@ from typing import AsyncIterator
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app import models  # noqa: F401  (side-effect import for Base.metadata)
+from app.auth.router import router as auth_router
 from app.config import get_settings
 from app.database import Base, get_db
-
-# Importing the models package is what registers the tables on
-# `Base.metadata`. Without this, `create_all` is a no-op.
-from app import models  # noqa: F401  (side-effect import)
 
 
 @asynccontextmanager
@@ -55,9 +53,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="Signal Clone Backend",
     version="0.1.0",
-    description="Phase 0/1 scaffolding. Auth, models, and WebSockets land in later phases.",
+    description="Phase 0/1/2 scaffolding. Auth, models, and WebSockets land in later phases.",
     lifespan=lifespan,
 )
+
+
+# --- Routers --------------------------------------------------------------
+# Mount the auth router with no prefix so its declared paths (`/auth/...`)
+# match the contract the frontend agent is building against. Only the
+# routes inside the auth router protect themselves; /, /health, etc.
+# remain public.
+app.include_router(auth_router)
 
 
 # --- CORS ------------------------------------------------------------------

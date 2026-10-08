@@ -100,6 +100,67 @@ sqlite3 app.db ".schema messages"
 # -> ... parent_id INTEGER, disappear_after_seconds INTEGER, ...
 ```
 
+## Auth (mocked OTP)
+
+The OTP is the constant `123456`. There is no SMS or email — the
+`/auth/request-otp` response includes a `debug_otp` field so the dev
+frontend can autofill it. Gate or remove that field before deploying.
+
+### Test auth with curl
+
+```bash
+# 1. Request an OTP (upserts the user; response includes debug_otp)
+curl -s -X POST http://localhost:8000/auth/request-otp \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"+15550000099"}'
+# -> {"sent":true,"debug_otp":"123456"}
+
+# 2. Verify the OTP — issues a JWT
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/verify-otp \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"+15550000099","otp":"123456"}' \
+  | python -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+
+# 3. /auth/me with the token
+curl -s http://localhost:8000/auth/me -H "Authorization: Bearer $TOKEN"
+
+# 4. PATCH /auth/profile
+curl -s -X PATCH http://localhost:8000/auth/profile \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"display_name":"Test User","username":"testuser99"}'
+
+# 5. /auth/me without a token — expect 401
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/auth/me
+# -> 401
+
+# 6. /auth/verify-otp with the wrong OTP — expect 401
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/auth/verify-otp \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"+15550000099","otp":"000000"}'
+# -> 401
+```
+
+The token payload includes `sub` (user id), `phone`, `iat`, `exp`, and
+`iss="signal-clone"`. Decode locally to inspect:
+
+```bash
+python -c "import sys, jwt as j; print(j.decode(sys.argv[1], options={'verify_signature':False}))" "$TOKEN"
+```
+
+### Auth smoke test
+
+A scripted end-to-end check (no pytest needed). Boots nothing extra —
+it talks to whatever's already serving on port 8000.
+
+```bash
+.venv/bin/python tests/test_auth.py
+```
+
+Exits 0 on success, non-zero on the first failing assertion. Safe to
+run repeatedly; uses a fresh phone (`+1555000<random>`) so the seed
+data isn't disturbed.
+
 ## Environment variables
 
 All settings live in `app/config.py` and are read from the environment or
@@ -108,9 +169,10 @@ All settings live in `app/config.py` and are read from the environment or
 | Var                  | Default                          | Notes |
 |----------------------|----------------------------------|-------|
 | `DATABASE_URL`       | `sqlite:///./app.db`             | SQLAlchemy URL. In prod, point at a Railway Volume mount. |
-| `JWT_SECRET`         | `change-me-in-prod`              | **Override in prod.** Used in Phase 2. |
-| `JWT_ALGORITHM`      | `HS256`                          | Used in Phase 2. |
-| `JWT_EXPIRES_MINUTES`| `10080` (7 days)                 | Used in Phase 2. |
+| `JWT_SECRET`         | `change-me-in-prod`              | **Override in prod.** HMAC secret for signing JWTs. |
+| `JWT_ALGORITHM`      | `HS256`                          | JWT signing algorithm. |
+| `JWT_EXPIRES_MINUTES`| `10080` (7 days)                 | Token TTL. |
+| `JWT_ISSUER`         | `signal-clone`                   | `iss` claim. Tokens with a different `iss` are rejected. |
 | `CORS_ORIGINS`       | `http://localhost:3000`          | Comma-separated. Add the prod frontend host when deploying. |
 
 ## Project layout
@@ -123,6 +185,13 @@ backend/
 │   ├── config.py          # pydantic-settings BaseSettings, loads .env
 │   ├── database.py        # SQLAlchemy engine, SessionLocal, get_db, WAL pragmas
 │   ├── seed.py            # `python -m app.seed` — idempotent demo data
+│   ├── auth/              # Phase 2: mocked-OTP login + JWT
+│   │   ├── __init__.py
+│   │   ├── jwt.py         # encode/decode (HS256, iss, exp)
+│   │   ├── otp.py         # constant 123456
+│   │   ├── schemas.py     # RequestOtp, VerifyOtp, ProfileUpdate, UserOut
+│   │   ├── deps.py        # get_current_user → User
+│   │   └── router.py      # /auth/request-otp, /verify-otp, /me, /profile
 │   └── models/            # SQLAlchemy 2.x typed declarative models
 │       ├── __init__.py    # re-exports so Base.metadata sees everything
 │       ├── enums.py       # ConversationType, MessageType, MessageStatusState, …
@@ -133,7 +202,8 @@ backend/
 │       ├── attachment.py
 │       └── reaction.py        # MessageReaction
 ├── tests/
-│   └── __init__.py
+│   ├── __init__.py
+│   └── test_auth.py       # end-to-end smoke (httpx against running uvicorn)
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt

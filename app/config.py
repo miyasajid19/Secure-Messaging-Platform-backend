@@ -31,7 +31,8 @@ class Settings(BaseSettings):
         description="HMAC secret for signing JWTs. MUST be overridden in prod.",
     )
     jwt_algorithm: str = Field(default="HS256")
-    jwt_expires_minutes: int = Field(default=10080)  # 7 days
+    jwt_expires_minutes: int = Field(default=60 * 24 * 7)  # 7 days
+    jwt_issuer: str = Field(default="signal-clone")
 
     # --- CORS -------------------------------------------------------------
     # Comma-separated string in .env, parsed into a list here.
