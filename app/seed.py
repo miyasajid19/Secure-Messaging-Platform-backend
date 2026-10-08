@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from app.database import Base, SessionLocal, engine
 from app.models import (
     Attachment,
+    Contact,
     Conversation,
     ConversationParticipant,
     ConversationType,
@@ -277,7 +278,9 @@ def _seed(db: Session) -> None:
     users_by_id = {u.id: u for u in (alice, bob, carol, dan, eve)}
 
     # 2) Conversations ------------------------------------------------------
-    # 3 groups, 4 direct = 7 conversations total.
+    # 3 groups, 4 direct = 7 conversations total. Alice is added to the
+    # Squad group too (spec: she should be a participant in enough
+    # conversations that `GET /conversations` returns ≥5 for her).
     phoenix = _get_or_create_group(
         db, "Project Phoenix", [alice.id, bob.id, carol.id]
     )
@@ -285,13 +288,37 @@ def _seed(db: Session) -> None:
         db, "Family Group", [alice.id, bob.id, dan.id, eve.id]
     )
     squad = _get_or_create_group(
-        db, "Squad Goals", [carol.id, dan.id, eve.id]
+        db, "Squad Goals", [alice.id, carol.id, dan.id, eve.id]
     )
 
     d_ab = _get_or_create_direct(db, alice.id, bob.id)
     d_ac = _get_or_create_direct(db, alice.id, carol.id)
     d_bd = _get_or_create_direct(db, bob.id, dan.id)
     d_ce = _get_or_create_direct(db, carol.id, eve.id)
+
+    # 2b) Contacts --------------------------------------------------------
+    # Phase 4 needs ≥2 contacts for Alice so `GET /contacts` returns
+    # data on a fresh DB. We also add a couple of cross-address-book
+    # rows so the search endpoint can show a mix of `already_contact`
+    # true/false. Notably, Alice does NOT have Bob as a contact yet —
+    # the conversations smoke test asserts that POST /contacts for Bob
+    # succeeds (i.e. creates a new contact row), so we leave that slot
+    # empty.
+    def _add_contact(owner: User, target: User) -> None:
+        existing = (
+            db.query(Contact)
+            .filter(Contact.owner_id == owner.id, Contact.contact_id == target.id)
+            .one_or_none()
+        )
+        if existing is not None:
+            return
+        db.add(Contact(owner_id=owner.id, contact_id=target.id))
+        db.flush()
+
+    _add_contact(alice, carol)
+    _add_contact(alice, dan)
+    _add_contact(bob, alice)
+    _add_contact(dan, alice)
 
     # 3) Messages -----------------------------------------------------------
     # Direct conversations: 5 messages each, spread over 7 days.

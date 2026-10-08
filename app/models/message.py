@@ -73,6 +73,10 @@ class MessageStatus(Base):
     __tablename__ = "message_status"
     __table_args__ = (
         UniqueConstraint("message_id", "user_id", name="uq_status_msg_user"),
+        # Phase 4 unread-count subquery: `WHERE user_id = ? AND status != 'read'`
+        # joined against the messages table for conversation filter. Putting
+        # user_id first matches the leftmost-prefix lookup pattern.
+        Index("ix_message_status_user", "user_id", "message_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

@@ -1,9 +1,11 @@
 """FastAPI entrypoint.
 
-Phase 0/1/2 scope: a /health endpoint that reports row counts, a /auth/*
-router for mocked-OTP login + JWT + protected profile, and a / root for
-process-up sanity checks. CORS is wired up so the Next.js dev server
-(localhost:3000) can call us without preflight failures later.
+Phase 0/1/2/4 scope: a /health endpoint that reports row counts, an
+/auth/* router for mocked-OTP login + JWT + protected profile, a / root
+for process-up sanity checks, and the Phase 4 read-API routers
+(/conversations, /contacts, /users). CORS is wired up so the Next.js
+dev server (localhost:3000) can call us without preflight failures
+later.
 """
 
 from contextlib import asynccontextmanager
@@ -17,7 +19,10 @@ from sqlalchemy.orm import Session
 from app import models  # noqa: F401  (side-effect import for Base.metadata)
 from app.auth.router import router as auth_router
 from app.config import get_settings
+from app.contacts.router import router as contacts_router
+from app.conversations.router import router as conversations_router
 from app.database import Base, get_db
+from app.users.router import router as users_router
 
 
 @asynccontextmanager
@@ -53,17 +58,20 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="Signal Clone Backend",
     version="0.1.0",
-    description="Phase 0/1/2 scaffolding. Auth, models, and WebSockets land in later phases.",
+    description="Phase 0/1/2/4 scaffolding. Auth, read API, and WebSockets land in later phases.",
     lifespan=lifespan,
 )
 
 
 # --- Routers --------------------------------------------------------------
-# Mount the auth router with no prefix so its declared paths (`/auth/...`)
-# match the contract the frontend agent is building against. Only the
-# routes inside the auth router protect themselves; /, /health, etc.
-# remain public.
+# Mount the routers with no prefix so their declared paths
+# (`/auth/...`, `/conversations/...`, `/contacts`, `/users/search`)
+# match the contract the frontend agent is building against. Each
+# router protects its own routes; only /, /health remain public.
 app.include_router(auth_router)
+app.include_router(conversations_router)
+app.include_router(contacts_router)
+app.include_router(users_router)
 
 
 # --- CORS ------------------------------------------------------------------

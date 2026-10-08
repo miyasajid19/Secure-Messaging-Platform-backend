@@ -161,6 +161,74 @@ Exits 0 on success, non-zero on the first failing assertion. Safe to
 run repeatedly; uses a fresh phone (`+1555000<random>`) so the seed
 data isn't disturbed.
 
+## Read API
+
+All routes below require `Authorization: Bearer <token>` (the JWT from
+`/auth/verify-otp`). `/`, `/health`, and `/auth/*` are the only public
+routes. The smoke script `tests/test_conversations.py` exercises each of
+these against Alice's token.
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/verify-otp \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"+15550000001","otp":"123456"}' \
+  | python -c "import sys,json; print(json.load(sys.stdin)['token'])")
+H="Authorization: Bearer $TOKEN"
+```
+
+### `GET /conversations`
+
+```bash
+curl -s http://localhost:8000/conversations -H "$H" | python -m json.tool
+```
+
+Returns the current user's conversations, most-recent-activity first.
+Each entry includes participants, last message preview, unread count,
+and a computed `avatar_url` (other user's avatar for direct chats;
+DiceBear initials URL for groups).
+
+### `GET /conversations/{id}/messages?limit=50&before=<message_id>`
+
+```bash
+curl -s "http://localhost:8000/conversations/1/messages?limit=5" -H "$H" | python -m json.tool
+```
+
+Paginated timeline, ASC by time. `before` is a message id; omit it for
+the latest `limit` messages. 403 if the caller isn't a participant.
+
+### `GET /contacts`
+
+```bash
+curl -s http://localhost:8000/contacts -H "$H" | python -m json.tool
+```
+
+Current user's address book, newest first.
+
+### `POST /contacts`
+
+```bash
+curl -s -X POST http://localhost:8000/contacts \
+  -H "$H" -H 'Content-Type: application/json' \
+  -d '{"phone":"+15550000002"}' | python -m json.tool
+```
+
+Add a contact by phone. Returns the (new or existing) `direct`
+conversation as a `ConversationOut`. Status codes:
+- `404` if the phone doesn't match a user
+- `409` if already a contact
+- `200` on success
+
+### `GET /users/search?q=<query>`
+
+```bash
+curl -s "http://localhost:8000/users/search?q=ali" -H "$H" | python -m json.tool
+```
+
+Case-insensitive search across phone prefix, display_name substring,
+and username substring. Excludes the caller. `already_contact` is true
+if a `contacts` row already exists. Empty `q` returns `[]`. Capped at
+20 results.
+
 ## Environment variables
 
 All settings live in `app/config.py` and are read from the environment or
@@ -192,6 +260,18 @@ backend/
 │   │   ├── schemas.py     # RequestOtp, VerifyOtp, ProfileUpdate, UserOut
 │   │   ├── deps.py        # get_current_user → User
 │   │   └── router.py      # /auth/request-otp, /verify-otp, /me, /profile
+│   ├── schemas/           # Phase 4: Pydantic response models
+│   │   └── __init__.py    # ConversationOut, MessageOut, ContactOut, UserSearchResult, …
+│   ├── conversations/     # Phase 4: list + message timeline
+│   │   ├── __init__.py
+│   │   ├── router.py      # /conversations, /conversations/{id}/messages
+│   │   └── service.py     # last_message, unread_count, avatar_url, assembler
+│   ├── contacts/          # Phase 4: list + add
+│   │   ├── __init__.py
+│   │   └── router.py      # /contacts (GET, POST)
+│   ├── users/             # Phase 4: search
+│   │   ├── __init__.py
+│   │   └── router.py      # /users/search
 │   └── models/            # SQLAlchemy 2.x typed declarative models
 │       ├── __init__.py    # re-exports so Base.metadata sees everything
 │       ├── enums.py       # ConversationType, MessageType, MessageStatusState, …
@@ -203,7 +283,8 @@ backend/
 │       └── reaction.py        # MessageReaction
 ├── tests/
 │   ├── __init__.py
-│   └── test_auth.py       # end-to-end smoke (httpx against running uvicorn)
+│   ├── test_auth.py           # auth smoke (Phase 2)
+│   └── test_conversations.py  # read-API smoke (Phase 4)
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
