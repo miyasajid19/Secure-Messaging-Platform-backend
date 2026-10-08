@@ -148,6 +148,26 @@ The token payload includes `sub` (user id), `phone`, `iat`, `exp`, and
 python -c "import sys, jwt as j; print(j.decode(sys.argv[1], options={'verify_signature':False}))" "$TOKEN"
 ```
 
+### Logout
+
+```bash
+curl -X POST http://localhost:8000/auth/logout \
+  -H "Authorization: Bearer $TOKEN"
+# -> {"logged_out":true}
+```
+
+Server-side effect: bumps `users.last_seen`, force-closes the user's
+WebSocket (so other tabs go offline), and broadcasts
+`presence {online: false}` to other connected users.
+
+**Caveat:** the JWT is stateless, so it remains valid until its `exp`
+even after logout. The endpoint cleans up server-side state (WS
+connection, presence broadcast, `last_seen`) but does not invalidate
+the token. The frontend must drop the token from `localStorage` on
+logout so subsequent requests re-authenticate. To revoke individual
+tokens you'd need a `token_version` column and a check in
+`get_current_user` — out of scope for this milestone.
+
 ### Auth smoke test
 
 A scripted end-to-end check (no pytest needed). Boots nothing extra —
@@ -315,6 +335,110 @@ For a real WS exercise use the smoke test:
 It opens two clients (Alice + Bob), exchanges typing and a `message.new`
 round-trip, and verifies the manager's in-memory state.
 
+## Groups
+
+Group conversation CRUD lives under `/conversations/...` (no separate
+prefix). The caller of `POST /conversations` becomes the first admin.
+All member-management endpoints are admin-only; the spec table is in
+`task.md` §7.
+
+### Create a group
+
+```bash
+curl -s -X POST http://localhost:8000/conversations \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"group","name":"Project Phoenix","member_ids":[2,3,4]}' \
+  | python -m json.tool
+```
+
+Response is a `ConversationOut` (201) with 3 participants, `my_role: "admin"`,
+`members_can_be_added: true`, and a system message already in
+`last_message` so the group shows up at the top of the list.
+
+The caller's id is **silently deduped** from `member_ids` if present
+(UI flows naturally include the caller when picking members), and
+duplicate ids in the list are dropped. So `member_ids: [1, 2, 2, 3]`
+from user 1 is equivalent to `member_ids: [2, 3]` and produces a
+3-person group. Only ids that don't correspond to a real user still
+trigger a 403.
+
+A `message.new` event with `type: "system"` is broadcast to every
+member so their UIs pick up the new group without a refetch.
+
+### Add / remove / promote members
+
+```bash
+# Add Dan (id=4) to conversation 8
+curl -s -X POST http://localhost:8000/conversations/8/members \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id": 4}'
+
+# Promote Bob (id=2) to admin
+curl -s -X PATCH http://localhost:8000/conversations/8/members/2 \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"role": "admin"}'
+
+# Remove Carol (id=3) from the group
+curl -s -X DELETE http://localhost:8000/conversations/8/members/3 \
+  -H "Authorization: Bearer $TOKEN" \
+  -o /dev/null -w '%{http_code}\n'
+# -> 204
+```
+
+All three broadcast `message.new` (with a system message documenting
+the change) and `conversation.updated` so other tabs refresh their
+participant lists.
+
+### Delete a group
+
+```bash
+curl -s -X DELETE http://localhost:8000/conversations/8 \
+  -H "Authorization: Bearer $TOKEN" \
+  -o /dev/null -w '%{http_code}\n'
+# -> 204
+```
+
+Admin only. Cascade via FK. Broadcasts `conversation.deleted` to all
+participants so their UIs remove the row from the list.
+
+### Updated event types
+
+| event                 | payload                                                                                  |
+|-----------------------|------------------------------------------------------------------------------------------|
+| `message.new`         | now includes system messages (type=system) for create / add / remove / promote            |
+| `conversation.updated`| `{type, conversation: ConversationOut}` — broadcast on every member-list change          |
+| `conversation.deleted`| `{type, conversation_id}` — broadcast on group delete                                    |
+
+### Admin rules
+
+- `POST /conversations/{id}/members` — caller must be admin
+- `DELETE /conversations/{id}/members/{uid}` — caller must be admin; **400** if it's the last admin leaving
+- `PATCH /conversations/{id}/members/{uid}` — caller must be admin
+- `DELETE /conversations/{id}` — caller must be admin
+
+### User search with conversation scope
+
+```bash
+curl -s "http://localhost:8000/users/search?q=dan&conversation_id=8" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+`already_member` is `True` for users already in conversation 8. Without
+`conversation_id`, `already_member` is always `False`.
+
+### Smoke test
+
+```bash
+.venv/bin/python tests/test_groups.py
+```
+
+35+ assertions covering create/add/remove/promote/delete, admin
+enforcement, last-admin rule, group message broadcast to 3 clients,
+and the `already_member` flag on `/users/search`.
+
 ## Environment variables
 
 All settings live in `app/config.py` and are read from the environment or
@@ -345,7 +469,7 @@ backend/
 │   │   ├── otp.py         # constant 123456
 │   │   ├── schemas.py     # RequestOtp, VerifyOtp, ProfileUpdate, UserOut
 │   │   ├── deps.py        # get_current_user → User
-│   │   └── router.py      # /auth/request-otp, /verify-otp, /me, /profile
+│   │   └── router.py      # /auth/request-otp, /verify-otp, /me, /profile, /logout
 │   ├── schemas/           # Phase 4: Pydantic response models
 │   │   └── __init__.py    # ConversationOut, MessageOut, ContactOut, UserSearchResult, …
 │   ├── conversations/     # Phase 4: list + message timeline
@@ -376,7 +500,8 @@ backend/
 │   ├── __init__.py
 │   ├── test_auth.py           # auth smoke (Phase 2)
 │   ├── test_conversations.py  # read-API smoke (Phase 4)
-│   └── test_realtime.py       # WS + send/read/status smoke (Phase 5)
+│   ├── test_realtime.py       # WS + send/read/status smoke (Phase 5)
+│   └── test_groups.py         # group CRUD + admin rules smoke (Phase 6)
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
@@ -399,7 +524,6 @@ re-run `python -m app.seed`.
 
 ## What lands in later phases
 
-- Phase 6: Group messaging.
 - Phase 7: Polish & Signal feel (toasts, modals, keyboard shortcuts).
 - Phase 8: Bonus features (reply/quoted, reactions, disappearing, attachments).
 - Phase 9: Deploy to Railway with a persistent Volume for `app.db`.

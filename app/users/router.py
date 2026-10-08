@@ -7,7 +7,7 @@ flag so the UI can decide whether to show "Add" or open the chat.
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, or_, select
@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.auth.deps import get_current_user
 from app.database import get_db
-from app.models import Contact, User
+from app.models import Contact, ConversationParticipant, User
 from app.realtime import connection_manager
 from app.schemas import UserSearchResult
 
@@ -38,6 +38,11 @@ func_lower = func.lower
 @router.get("/users/search", response_model=List[UserSearchResult])
 def search_users(
     q: str = Query(default="", description="Search by phone prefix, display_name, or username"),
+    conversation_id: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description="If set, results include `already_member` for this conversation.",
+    ),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[UserSearchResult]:
@@ -49,6 +54,8 @@ def search_users(
     - Excludes the caller.
     - Empty `q` returns an empty list (avoids the obvious "list
       everyone" probe).
+    - If `conversation_id` is set, `already_member` is True for users
+      already in that conversation. Otherwise it's always False.
     """
     q = q.strip()
     if not q:
@@ -78,7 +85,8 @@ def search_users(
     if not candidates:
         return []
 
-    # Compute `already_contact` in a single round-trip.
+    # Compute `already_contact` and (optionally) `already_member` in
+    # one round-trip each.
     candidate_ids = [u.id for u in candidates]
     contact_rows = db.execute(
         select(Contact.contact_id).where(
@@ -86,7 +94,18 @@ def search_users(
             Contact.contact_id.in_(candidate_ids),
         )
     ).scalars()
-    already = set(contact_rows)
+    already_contacts = set(contact_rows)
+
+    already_members: set[int] = set()
+    if conversation_id is not None:
+        already_members = set(
+            db.execute(
+                select(ConversationParticipant.user_id).where(
+                    ConversationParticipant.conversation_id == conversation_id,
+                    ConversationParticipant.user_id.in_(candidate_ids),
+                )
+            ).scalars()
+        )
 
     return [
         UserSearchResult(
@@ -94,7 +113,8 @@ def search_users(
             phone=u.phone,
             display_name=u.display_name,
             avatar_url=u.avatar_url,
-            already_contact=u.id in already,
+            already_contact=u.id in already_contacts,
+            already_member=u.id in already_members,
         )
         for u in candidates
     ]

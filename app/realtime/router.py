@@ -178,6 +178,12 @@ async def websocket_endpoint(
             continue
         await connection_manager.send_to_user(other_id, presence_on)
 
+    # Mark this connection as ready. Broadcasts from this point on
+    # will wait briefly for this event so the sender's WS is reliably
+    # able to receive its own `message.new` — see the UI-send race
+    # note in `manager.py` (READY_WAIT_SECONDS).
+    connection_manager.mark_ready(user.id)
+
     # --- 3. Reader loop -----------------------------------------------
     try:
         while True:

@@ -1,19 +1,23 @@
-"""Auth router: mocked-OTP login + JWT issue + protected profile/me.
+"""Auth router: mocked-OTP login + JWT issue + protected profile/me/logout.
 
 Endpoints:
   POST /auth/request-otp   — public, upsert user by phone
   POST /auth/verify-otp    — public, issue JWT
   GET  /auth/me            — protected, return current user
   PATCH /auth/profile      — protected, update display fields + bump last_seen
+  POST /auth/logout        — protected, close WS + presence offline + bump last_seen
 
-Phase 5 will add a WebSocket handler that reuses `app.auth.deps.decode_token`
-for the upgrade handshake. Keeping the HTTP router thin (no JWT logic
-inline) makes that future import straightforward.
+The JWT is stateless: it remains valid until `exp` even after logout.
+The endpoint's job is to clean up server-side state (active WS
+connection, presence broadcast, `last_seen` timestamp) so other
+clients see the user go offline promptly. Revocation is out of scope
+for this milestone.
 """
 
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -31,6 +35,8 @@ from app.auth.schemas import (
 )
 from app.database import get_db
 from app.models import User
+from app.realtime import connection_manager
+from app.realtime.events import PresenceEvent
 
 
 router = APIRouter(tags=["auth"])
@@ -148,3 +154,49 @@ def update_profile(
 
     db.refresh(current_user)
     return UserOut.model_validate(current_user)
+
+
+# --- /auth/logout --------------------------------------------------------
+
+
+class LogoutOut(BaseModel):
+    logged_out: bool
+
+
+@router.post("/auth/logout", response_model=LogoutOut)
+async def logout(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> LogoutOut:
+    """Clean up server-side state on logout.
+
+    Side effects:
+      1. Bump `users.last_seen = now()`.
+      2. Force-close any active WS for this user (logout/kick).
+      3. Broadcast `presence {user_id, online: false}` to other users.
+
+    The JWT itself is **not** invalidated — it remains valid until
+    its `exp`. Stateless tokens are a known limitation; revoking
+    individual tokens would require a `token_version` column and a
+    check in `get_current_user`. The frontend should drop the token
+    from `localStorage` so a subsequent request re-authenticates.
+    """
+    # 1. Bump last_seen.
+    current_user.last_seen = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(current_user)
+
+    # 2. Force-close any active WS for this user.
+    was_online = await connection_manager.force_disconnect(current_user.id, code=1000)
+
+    # 3. Broadcast presence offline to anyone still online.
+    if was_online:
+        presence_off: PresenceEvent = {
+            "type": "presence",
+            "user_id": current_user.id,
+            "online": False,
+        }
+        for other_id in connection_manager.online_users():
+            await connection_manager.send_to_user(other_id, presence_off)
+
+    return LogoutOut(logged_out=True)

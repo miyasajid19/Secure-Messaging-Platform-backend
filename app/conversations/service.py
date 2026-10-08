@@ -180,19 +180,36 @@ def to_conversation_out(
     Lifted out of the router module so other modules (notably
     `app.contacts.router` which adds a contact and needs to return the
     matching `ConversationOut`) can use it without a circular import.
+
+    `members_can_be_added` is True for groups so the frontend can show
+    the "Add member" affordance; `my_role` is the caller's role in
+    this conversation (None for direct chats where the concept
+    doesn't apply).
     """
     last_msg = get_last_message(db, conv.id)
     unread = get_unread_count(db, conv.id, current_user_id)
     participants = get_participants(db, conv.id)
 
-    if conv.type.value == "direct":
-        avatar = direct_avatar_url(db, conv.id, current_user_id)
-    else:
+    is_group = conv.type.value == "group"
+    if is_group:
         avatar = group_avatar_url(conv)
+    else:
+        avatar = direct_avatar_url(db, conv.id, current_user_id)
 
     last_message_payload: Optional[MessagePreview] = None
     if last_msg is not None:
         last_message_payload = MessagePreview.model_validate(last_msg)
+
+    my_role: Optional[str] = None
+    if is_group:
+        # The caller's participant row tells us their role. Direct
+        # conversations don't have roles.
+        for p in db.query(ConversationParticipant).filter(
+            ConversationParticipant.conversation_id == conv.id,
+            ConversationParticipant.user_id == current_user_id,
+        ).all():
+            my_role = p.role.value
+            break
 
     return ConversationOut(
         id=conv.id,
@@ -204,4 +221,6 @@ def to_conversation_out(
         unread_count=unread,
         avatar_url=avatar,
         participants=[UserOut.model_validate(u) for u in participants],
+        members_can_be_added=is_group,
+        my_role=my_role,
     )

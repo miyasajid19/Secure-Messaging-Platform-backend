@@ -237,6 +237,61 @@ def main() -> int:
         r = client.get("/users/online", headers=a_h)
         _assert(r.json() == [], f"/users/online empty after both disconnect (got {r.json()})")
 
+        # 10. /auth/logout force-closes the WS (logout case) ------------
+        # Open a fresh WS for Alice, then POST /auth/logout via REST.
+        # The WS should close with code 1000 within ~1s.
+        with client.websocket_connect(f"/ws?token={alice_token}") as ws_alice:
+            # Drain the initial snapshot
+            json.loads(ws_alice.receive_text())
+            r = client.get("/users/online", headers=a_h)
+            _assert(alice_id in r.json(), "Alice is online before logout")
+
+            t0 = time.monotonic()
+            r = client.post("/auth/logout", headers=a_h)
+            _assert(
+                r.status_code == 200 and r.json().get("logged_out") is True,
+                f"POST /auth/logout -> 200 logged_out=true (got {r.status_code} {r.text})",
+            )
+
+            # The WS should close. TestClient raises a WebSocketDisconnect
+            # (or surfaces a close code) when the server closes the
+            # underlying connection.
+            try:
+                # Try to receive; the server-initiated close should
+                # surface here within the heartbeat window.
+                ws_alice.receive_text()
+                _assert(False, "WS did not close after /auth/logout")
+            except Exception as exc:  # noqa: BLE001
+                elapsed = time.monotonic() - t0
+                _assert(elapsed < 1.5, f"WS closed within 1.5s (took {elapsed:.2f}s)")
+                # The exception name should hint at a close; we don't
+                # assert on the exact class because TestClient's wrapper
+                # changes between versions.
+                _assert(
+                    "Disconnect" in type(exc).__name__ or "Close" in type(exc).__name__,
+                    f"WS closed with an exception (got {type(exc).__name__})",
+                )
+
+        # 11. /auth/logout broadcasts presence offline to other users -----
+        # Reopen Alice's WS, then with Bob also online, have Alice logout
+        # and verify Bob sees presence {online: false}.
+        with client.websocket_connect(f"/ws?token={alice_token}") as ws_alice2, \
+             client.websocket_connect(f"/ws?token={bob_token}") as ws_bob2:
+            # Drain snapshots
+            for ws, who in ((ws_alice2, "alice"), (ws_bob2, "bob")):
+                json.loads(ws.receive_text())
+                _assert(True, f"{who} got snapshot before logout test")
+
+            r = client.post("/auth/logout", headers=a_h)
+            _assert(r.status_code == 200, "second logout -> 200")
+
+            # Bob should see a presence {online: false} event for Alice.
+            ev = _drain_until(ws_bob2, "presence", timeout=2.0)
+            _assert(
+                ev.get("user_id") == alice_id and ev.get("online") is False,
+                f"Bob saw Alice go offline: {ev}",
+            )
+
     print("\nall realtime checks passed.")
     return 0
 

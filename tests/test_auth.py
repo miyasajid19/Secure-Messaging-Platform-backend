@@ -124,6 +124,42 @@ def main() -> int:
         r = client.patch("/auth/profile", json={"display_name": "x"})
         _assert(r.status_code == 401, f"PATCH /auth/profile (no token) -> 401 (got {r.status_code})")
 
+        # 7. POST /auth/logout (with valid token) --------------------------
+        # Note: this doesn't close the WS (we didn't open one here), but
+        # it should bump last_seen and return logged_out=true. The
+        # WS-close behavior is exercised in tests/test_realtime.py.
+        before = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json().get("last_seen")
+        r = client.post("/auth/logout", headers={"Authorization": f"Bearer {token}"})
+        _assert(
+            r.status_code == 200,
+            f"POST /auth/logout -> 200 (got {r.status_code} {r.text})",
+        )
+        _assert(r.json().get("logged_out") is True, "logout response: logged_out=true")
+        after = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).json().get("last_seen")
+        _assert(after is not None, "last_seen is set after logout")
+        # logout bumps it to >= before (or equal at the same UTC instant)
+        if before is not None and after is not None:
+            _assert(after >= before, f"last_seen moved forward on logout ({before} -> {after})")
+
+        # 7b. POST /auth/logout without a token -> 401 --------------------
+        r = client.post("/auth/logout")
+        _assert(r.status_code == 401, f"POST /auth/logout (no token) -> 401 (got {r.status_code})")
+
+        # 7c. POST /auth/logout with garbage token -> 401 -----------------
+        r = client.post("/auth/logout", headers={"Authorization": "Bearer not-a-jwt"})
+        _assert(
+            r.status_code == 401,
+            f"POST /auth/logout (bad token) -> 401 (got {r.status_code})",
+        )
+
+        # Note: the token is still valid for /auth/me after logout
+        # (stateless JWT). This is documented in the README.
+        r = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+        _assert(
+            r.status_code == 200,
+            "JWT remains valid until exp even after logout (stateless)",
+        )
+
     print("\nall auth checks passed.")
     return 0
 
