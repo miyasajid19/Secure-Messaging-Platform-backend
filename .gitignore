@@ -4,7 +4,19 @@ __pycache__/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
 # Virtual environments
 .venv
+
+# Local environment
+.env
+
+# SQLite (dev) — keep the schema out of git
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Task spec — supervisor-managed, not part of the source
+task.md
