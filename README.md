@@ -229,6 +229,92 @@ and username substring. Excludes the caller. `already_contact` is true
 if a `contacts` row already exists. Empty `q` returns `[]`. Capped at
 20 results.
 
+## Realtime (WebSocket)
+
+`WS /ws?token=<jwt>` is the single bidirectional channel. Auth is via
+a query-param token (cookies don't survive cross-origin WS upgrades
+reliably; the locked pattern is `?token=<jwt>`). The HTTP contract
+still uses `Authorization: Bearer` — they're parallel mechanisms, not
+interchangeable.
+
+**Single-worker rule still applies.** The connection manager holds all
+state in memory (`_connections: dict[int, WebSocket]`,
+`_typing: dict[(conversation_id, user_id), float]`). Running more than
+one uvicorn worker would split the state across processes and break
+presence/typing. See `PLAN.md` "SQLite production config".
+
+### Client → Server
+
+```json
+{ "type": "typing.start", "conversation_id": 1 }
+{ "type": "typing.stop",  "conversation_id": 1 }
+{ "type": "message.read", "message_id": 42 }
+```
+
+### Server → Client
+
+| event                | payload                                                                         |
+|----------------------|---------------------------------------------------------------------------------|
+| `presence.snapshot`  | `{ type, online_user_ids: [int, ...] }` — sent once on connect                  |
+| `presence`           | `{ type, user_id, online: bool }` — broadcast to other clients on join/leave   |
+| `typing`             | `{ type, conversation_id, user_id, state: "start" \| "stop" }`                |
+| `message.new`        | `{ type, message: MessageOut }`                                                |
+| `message.read`       | `{ type, message_id, read_by, read_at }` (single message via WS)              |
+| `message.read.bulk`  | `{ type, conversation_id, reader_id, up_to_message_id }` (via REST `/read`)   |
+
+`typing` is automatically broadcast as `state: "stop"` after 6s of
+silence (the manager's sweeper task).
+
+### Realtime REST endpoints
+
+| Method | Path                                                       | Notes |
+|--------|------------------------------------------------------------|-------|
+| `POST` | `/conversations/{id}/messages`                              | Send. Body `{content, type?, parent_id?}`. 201 + `MessageOut`. |
+| `POST` | `/conversations/{id}/read`                                  | Mark read. Body `{message_id}`. Returns `{marked_read}`. |
+| `GET`  | `/conversations/{id}/message-status?message_ids=1,2,3`      | `{message_id: status}` map. |
+| `GET`  | `/users/online`                                            | `[user_id, ...]` of currently connected users. |
+
+### Quick sanity check
+
+```bash
+# Get Alice's token
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/verify-otp \
+  -H 'Content-Type: application/json' \
+  -d '{"phone":"+15550000001","otp":"123456"}' \
+  | python -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+# Online users
+curl -s http://localhost:8000/users/online -H "Authorization: Bearer $TOKEN"
+# -> []
+
+# Send a message (Alice → direct conversation with Bob, id=1 in the seed)
+curl -s -X POST http://localhost:8000/conversations/1/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"hello from curl"}' | python -m json.tool
+
+# Mark read
+curl -s -X POST http://localhost:8000/conversations/1/read \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"message_id":1}'
+# -> {"marked_read":1}
+
+# Per-message status
+curl -s "http://localhost:8000/conversations/1/message-status?message_ids=1,2" \
+  -H "Authorization: Bearer $TOKEN"
+# -> {"1":"read"}
+```
+
+For a real WS exercise use the smoke test:
+
+```bash
+.venv/bin/python tests/test_realtime.py
+```
+
+It opens two clients (Alice + Bob), exchanges typing and a `message.new`
+round-trip, and verifies the manager's in-memory state.
+
 ## Environment variables
 
 All settings live in `app/config.py` and are read from the environment or
@@ -269,9 +355,14 @@ backend/
 │   ├── contacts/          # Phase 4: list + add
 │   │   ├── __init__.py
 │   │   └── router.py      # /contacts (GET, POST)
-│   ├── users/             # Phase 4: search
+│   ├── users/             # Phase 4: search; Phase 5: online
 │   │   ├── __init__.py
-│   │   └── router.py      # /users/search
+│   │   └── router.py      # /users/search, /users/online
+│   ├── realtime/          # Phase 5: WebSocket + in-memory manager
+│   │   ├── __init__.py    # exposes the singleton `connection_manager`
+│   │   ├── manager.py     # ConnectionManager (state + typing sweeper)
+│   │   ├── events.py      # TypedDicts for the WS event protocol
+│   │   └── router.py      # /ws WebSocket + presence/typing/reads
 │   └── models/            # SQLAlchemy 2.x typed declarative models
 │       ├── __init__.py    # re-exports so Base.metadata sees everything
 │       ├── enums.py       # ConversationType, MessageType, MessageStatusState, …
@@ -284,7 +375,8 @@ backend/
 ├── tests/
 │   ├── __init__.py
 │   ├── test_auth.py           # auth smoke (Phase 2)
-│   └── test_conversations.py  # read-API smoke (Phase 4)
+│   ├── test_conversations.py  # read-API smoke (Phase 4)
+│   └── test_realtime.py       # WS + send/read/status smoke (Phase 5)
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
@@ -307,8 +399,7 @@ re-run `python -m app.seed`.
 
 ## What lands in later phases
 
-- Phase 2: JWT auth (mocked OTP → real token) + Pydantic schemas.
-- Phase 4: Conversation list and contact REST endpoints.
-- Phase 5: WebSocket endpoint at `/ws`.
+- Phase 6: Group messaging.
+- Phase 7: Polish & Signal feel (toasts, modals, keyboard shortcuts).
 - Phase 8: Bonus features (reply/quoted, reactions, disappearing, attachments).
 - Phase 9: Deploy to Railway with a persistent Volume for `app.db`.

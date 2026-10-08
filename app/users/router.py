@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.auth.deps import get_current_user
 from app.database import get_db
 from app.models import Contact, User
+from app.realtime import connection_manager
 from app.schemas import UserSearchResult
 
 
@@ -97,3 +98,20 @@ def search_users(
         )
         for u in candidates
     ]
+
+
+# --- /users/online -------------------------------------------------------
+
+
+@router.get("/users/online", response_model=List[int])
+def online_users(
+    current_user: User = Depends(get_current_user),  # noqa: ARG001  (forces JWT)
+) -> List[int]:
+    """Return user ids currently connected via WebSocket.
+
+    Read from the in-memory `ConnectionManager` — the source of truth
+    is the WS connection table, not the DB. Always includes the
+    caller if they're connected (which they should be, since the
+    frontend will call this right after `GET /auth/me`).
+    """
+    return sorted(connection_manager.online_users())

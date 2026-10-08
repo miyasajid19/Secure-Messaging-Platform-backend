@@ -1,11 +1,12 @@
 """FastAPI entrypoint.
 
-Phase 0/1/2/4 scope: a /health endpoint that reports row counts, an
+Phase 0/1/2/4/5 scope: a /health endpoint that reports row counts, an
 /auth/* router for mocked-OTP login + JWT + protected profile, a / root
-for process-up sanity checks, and the Phase 4 read-API routers
-(/conversations, /contacts, /users). CORS is wired up so the Next.js
-dev server (localhost:3000) can call us without preflight failures
-later.
+for process-up sanity checks, the Phase 4 read-API routers
+(/conversations, /contacts, /users), and the Phase 5 realtime stack
+(/ws WebSocket + send/read/message-status REST + /users/online).
+CORS is wired up so the Next.js dev server (localhost:3000) can call
+us without preflight failures later.
 """
 
 from contextlib import asynccontextmanager
@@ -22,6 +23,8 @@ from app.config import get_settings
 from app.contacts.router import router as contacts_router
 from app.conversations.router import router as conversations_router
 from app.database import Base, get_db
+from app.realtime import connection_manager
+from app.realtime.router import router as realtime_router
 from app.users.router import router as users_router
 
 
@@ -34,6 +37,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     also call `Base.metadata.create_all` so a fresh `./app.db` is provisioned
     with the schema. The call is idempotent: existing tables are left
     alone, missing ones are created.
+
+    The realtime typing-expiry sweeper is started here so the lifecycle
+    is symmetric: a started task gets a stopped task. The
+    ConnectionManager itself is a module-level singleton — it survives
+    the lifespan handler.
 
     If the DB is unreachable we want uvicorn to crash loudly, not serve
     /health with a lie.
@@ -50,28 +58,40 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # create_all is safe to call repeatedly: SQLAlchemy emits CREATE TABLE
     # IF NOT EXISTS, so a warm restart doesn't error.
     Base.metadata.create_all(bind=engine)
-    print(f"[startup] DB OK ({settings.database_url}); tables ensured")
-    yield
-    # No teardown needed for SQLite — files flush on close.
+
+    # Start the typing-expiry sweeper (one background task per process).
+    await connection_manager.start()
+
+    print(
+        f"[startup] DB OK ({settings.database_url}); tables ensured; "
+        f"realtime sweeper running"
+    )
+    try:
+        yield
+    finally:
+        # Best-effort shutdown of the sweeper. The cancelled task is
+        # awaited so CancelledError propagates cleanly.
+        await connection_manager.stop()
 
 
 app = FastAPI(
     title="Signal Clone Backend",
     version="0.1.0",
-    description="Phase 0/1/2/4 scaffolding. Auth, read API, and WebSockets land in later phases.",
+    description="Phase 0/1/2/4/5 scaffolding. Auth, read API, and WebSockets live.",
     lifespan=lifespan,
 )
 
 
 # --- Routers --------------------------------------------------------------
 # Mount the routers with no prefix so their declared paths
-# (`/auth/...`, `/conversations/...`, `/contacts`, `/users/search`)
+# (`/auth/...`, `/conversations/...`, `/contacts`, `/users/...`, `/ws`)
 # match the contract the frontend agent is building against. Each
 # router protects its own routes; only /, /health remain public.
 app.include_router(auth_router)
 app.include_router(conversations_router)
 app.include_router(contacts_router)
 app.include_router(users_router)
+app.include_router(realtime_router)
 
 
 # --- CORS ------------------------------------------------------------------
