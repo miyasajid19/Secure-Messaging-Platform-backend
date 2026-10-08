@@ -216,6 +216,20 @@ curl -s "http://localhost:8000/conversations/1/messages?limit=5" -H "$H" | pytho
 Paginated timeline, ASC by time. `before` is a message id; omit it for
 the latest `limit` messages. 403 if the caller isn't a participant.
 
+Each `MessageOut` carries a `seen_by: list[UserOut]` field — the users
+who have marked that message as 'read', ordered ASC by when they read
+it (first reader at index 0, matches Messenger/WhatsApp). Empty `[]`
+for a freshly-sent message. The field is batch-loaded: one JOIN query
+across all messages in the response, not N+1.
+
+Each `MessageOut` also carries a `parent: MessageParent | None` field
+(Phase 8.1). For a reply, this is a preview of the quoted message
+(`{id, sender_id, sender_name, content, type}`); for a non-reply it's
+`null`. The `content` is truncated to 120 chars (`+ "…"` if cut);
+for image-type parents it's the sentinel `"📷 Photo"` so the
+frontend can render a photo icon without trying to fit a URL in the
+quote bubble.
+
 ### `GET /contacts`
 
 ```bash
@@ -279,6 +293,7 @@ presence/typing. See `PLAN.md` "SQLite production config".
 | `presence`           | `{ type, user_id, online: bool }` — broadcast to other clients on join/leave   |
 | `typing`             | `{ type, conversation_id, user_id, state: "start" \| "stop" }`                |
 | `message.new`        | `{ type, message: MessageOut }`                                                |
+| `message.delivered`  | `{ type, conversation_id, message_id, delivered_to }` — sent when a recipient gets the message |
 | `message.read`       | `{ type, message_id, read_by, read_at }` (single message via WS)              |
 | `message.read.bulk`  | `{ type, conversation_id, reader_id, up_to_message_id }` (via REST `/read`)   |
 
@@ -289,10 +304,30 @@ silence (the manager's sweeper task).
 
 | Method | Path                                                       | Notes |
 |--------|------------------------------------------------------------|-------|
-| `POST` | `/conversations/{id}/messages`                              | Send. Body `{content, type?, parent_id?}`. 201 + `MessageOut`. |
+| `POST` | `/conversations/{id}/messages`                              | Send. Body `{content, type?, parent_id?}`. 201 + `MessageOut`. `parent_id` is Phase 8.1: must reference a message in the same conversation; 400 otherwise. The response (and the `message.new` WS payload) carries a `parent: MessageParent` preview for replies. |
 | `POST` | `/conversations/{id}/read`                                  | Mark read. Body `{message_id}`. Returns `{marked_read}`. |
 | `GET`  | `/conversations/{id}/message-status?message_ids=1,2,3`      | `{message_id: status}` map. |
 | `GET`  | `/users/online`                                            | `[user_id, ...]` of currently connected users. |
+| `POST` | `/messages/{id}/reactions`                                 | Add a reaction. Body `{emoji}`. 201 + `ReactionGroup`. 400 empty/oversize, 404 missing/non-participant, 409 already-reacted. Phase 8.2. |
+| `DELETE` | `/messages/{id}/reactions/{emoji}`                        | Remove a reaction. 204 on success, 404 otherwise. |
+| `PATCH` | `/conversations/{id}/disappearing-timer`                   | Set `{ "disappear_after_seconds": 3600 }`; `null` disables. |
+| `GET` | `/conversations/{id}/disappearing-timer`                    | Read the current conversation timer. |
+
+### Message delivery indicators
+
+`GET /conversations/{id}/message-status?message_ids=...` returns the
+status for the current user's incoming messages and an aggregate status
+for messages they sent. Map the status values to the chat indicators:
+
+- `sent`: one tick; the recipient is offline.
+- `delivered`: double ticks; the recipient is online but has not read it.
+- `read`: hollow seen indicator; the recipient has read the message.
+
+When an online recipient gets a new message, or a recipient reconnects,
+pending `sent` rows become `delivered` and the server emits
+`message.delivered` to the conversation. In group chats,
+the sender's aggregate advances only when every recipient reaches the
+next state (for example, `read` means everyone has read it).
 
 ### Quick sanity check
 
@@ -334,6 +369,101 @@ For a real WS exercise use the smoke test:
 
 It opens two clients (Alice + Bob), exchanges typing and a `message.new`
 round-trip, and verifies the manager's in-memory state.
+
+## Disappearing messages (Phase 8.4)
+
+Set a conversation-wide timer for future messages. Allowed values are
+`3600` (1 hour), `86400` (1 day), `604800` (1 week), and `null` to
+disable it. `1` second is also accepted for demo and smoke-test use.
+The timer value is copied onto each new message when sent, so changing
+the conversation setting does not change existing messages. Expired
+messages are hard-deleted by a process-local sweep every 30 seconds,
+then each connected participant receives a `message.delete` event.
+
+```bash
+# Enable one-hour disappearing messages
+curl -s -X PATCH http://localhost:8000/conversations/1/disappearing-timer \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"disappear_after_seconds":3600}'
+# -> {"disappear_after_seconds":3600}
+
+# Check the current setting
+curl -s http://localhost:8000/conversations/1/disappearing-timer \
+  -H "Authorization: Bearer $TOKEN"
+
+# Disable the timer
+curl -s -X PATCH http://localhost:8000/conversations/1/disappearing-timer \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"disappear_after_seconds":null}'
+```
+
+The sweeper and WebSocket connection state are in memory, so run a
+single Uvicorn worker. Multiple workers would split sweeps and live
+connections across processes.
+
+## Reactions (Phase 8.2)
+
+Users can react to a message with an emoji. Each `MessageOut` carries
+a `reactions: list[ReactionGroup]` field, where each group is
+`{emoji, count, users: [ReactionUser, ...]}` (`users` is capped at
+10 — the `count` is always the full total so the UI can show "+N").
+The `reactions` field is batch-loaded: one JOIN query across all
+messages in the page, not N+1.
+
+```bash
+# Add a 👍 reaction to message 42
+curl -s -X POST http://localhost:8000/messages/42/reactions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"emoji":"👍"}'
+# -> {"emoji":"👍","count":1,"users":[{"id":1,"display_name":"Alice Chen","avatar_url":"..."}]}
+
+# Remove it
+curl -s -X DELETE http://localhost:8000/messages/42/reactions/%F0%9F%91%8D \
+  -H "Authorization: Bearer $TOKEN" \
+  -o /dev/null -w '%{http_code}\n'
+# -> 204
+```
+
+Status codes:
+- 201 with `ReactionGroup` on first add
+- 409 if you've already reacted with that emoji (idempotent for the UI)
+- 404 if the message doesn't exist or you're not a participant
+- 400 if the emoji is empty or > 16 chars
+
+**URL contract (Phase 8.2 405-fix guard):** the emoji is in the
+**body** for POST, in the **path** for DELETE. Putting the emoji in
+the path on POST (or sending GET to the reactions path) returns 405
+by design.
+
+| method | path                              | body         | result   |
+|--------|-----------------------------------|--------------|----------|
+| POST   | `/messages/{id}/reactions`        | `{"emoji":..}`| 201 / 400 / 404 / 409 |
+| POST   | `/messages/{id}/reactions/{emoji}`| —            | 405 by design |
+| DELETE | `/messages/{id}/reactions/{emoji}`| —            | 204 / 404 |
+| GET    | `/messages/{id}/reactions`        | —            | 405 by design |
+
+A `reactions.update` WS event fires on every add/remove with the full
+new list of reaction groups for that message — replace the local
+cache, don't try to diff.
+
+Emoji storage is UTF-8 round-trip safe (the `message_reactions.emoji`
+column is plain `VARCHAR(16)`; `sqlite3 ... "SELECT hex(emoji)"` on a
+posted 👍 shows `F09F918D`, not `3F3F`).
+
+```json
+{
+  "type": "reactions.update",
+  "conversation_id": 1,
+  "message_id": 42,
+  "reactions": [
+    {"emoji": "👍", "count": 2, "users": [{"id": 1, "display_name": "Alice", "avatar_url": "..."}, {"id": 2, "display_name": "Bob", "avatar_url": "..."}]},
+    {"emoji": "❤️", "count": 1, "users": [{"id": 3, "display_name": "Carol", "avatar_url": "..."}]}
+  ]
+}
+```
 
 ## Groups
 

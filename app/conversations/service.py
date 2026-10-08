@@ -223,4 +223,5 @@ def to_conversation_out(
         participants=[UserOut.model_validate(u) for u in participants],
         members_can_be_added=is_group,
         my_role=my_role,
+        disappear_after_seconds=conv.disappear_after_seconds,
     )

@@ -9,7 +9,7 @@ exists.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
@@ -25,6 +25,7 @@ from app.models import (
     ConversationParticipant,
     ConversationType,
     Message,
+    MessageReaction,
     MessageStatus,
     MessageStatusState,
     MessageType,
@@ -33,6 +34,7 @@ from app.models import (
 )
 from app.realtime import connection_manager
 from app.realtime.events import (
+    MessageDeliveredEvent,
     MessageNewEvent,
     MessageReadBulkEvent,
 )
@@ -40,6 +42,9 @@ from app.schemas import (
     AttachmentOut,
     ConversationOut,
     MessageOut,
+    MessageParent,
+    ReactionGroup,
+    ReactionUser,
     UserOut,
 )
 
@@ -51,6 +56,198 @@ router = APIRouter(tags=["conversations"])
 
 def _user_out(user: User) -> UserOut:
     return UserOut.model_validate(user)
+
+
+def _seen_by_for(db: Session, message_ids: list[int]) -> dict[int, list[UserOut]]:
+    """Batch-fetch "seen by" users for a set of message ids.
+
+    One JOIN query against `message_status` + `users` returns the
+    users who have marked each message as 'read', ordered ASC by
+    `message_status.updated_at` so the first reader lands at index 0
+    (matches Messenger's "seen by" UX).
+
+    The result is a dict keyed by message id; messages with no
+    readers are simply absent from the dict (the caller falls back
+    to an empty list via `seen_by_map.get(mid, [])`).
+    """
+    if not message_ids:
+        return {}
+    rows = db.execute(
+        select(MessageStatus.message_id, User)
+        .join(User, User.id == MessageStatus.user_id)
+        .where(
+            MessageStatus.message_id.in_(message_ids),
+            MessageStatus.status == MessageStatusState.READ,
+        )
+        .order_by(MessageStatus.updated_at.asc(), MessageStatus.user_id.asc())
+    ).all()
+    seen_by: dict[int, list[UserOut]] = {}
+    for mid, user in rows:
+        seen_by.setdefault(mid, []).append(UserOut.model_validate(user))
+    return seen_by
+
+
+# Length cap for the embedded `parent.content` preview. The frontend
+# renders this in a small quoted bubble above the new message; 120
+# chars keeps it on one line in the chat pane.
+_PARENT_PREVIEW_CHARS = 120
+# Stable sentinel for image-type parent previews. The frontend matches
+# on this string to render a photo icon.
+_PARENT_IMAGE_SENTINEL = "📷 Photo"
+
+
+def _truncate_preview(text: str, *, limit: int = _PARENT_PREVIEW_CHARS) -> str:
+    """Trim a string to `limit` characters, appending '…' if cut."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+def _parent_preview(db: Session, m: Message) -> Optional["MessageParent"]:
+    """Build a `MessageParent` for a message that has a `parent_id`.
+
+    Returns None if there's no parent, or if the parent has been
+    deleted (FK is SET NULL on delete, so this is rare — but the
+    `get` is cheap and defensive).
+    """
+    if m.parent_id is None:
+        return None
+    parent = db.get(Message, m.parent_id)
+    if parent is None:
+        return None
+    sender = db.get(User, parent.sender_id)
+    sender_name = sender.display_name if sender and sender.display_name else (sender.phone if sender else None)
+
+    # Image and system messages don't have a useful text preview.
+    if parent.type == MessageType.IMAGE:
+        content = _PARENT_IMAGE_SENTINEL
+    elif parent.type == MessageType.SYSTEM:
+        content = _truncate_preview(parent.content, limit=60)
+    else:
+        content = _truncate_preview(parent.content)
+
+    return MessageParent(
+        id=parent.id,
+        sender_id=parent.sender_id,
+        sender_name=sender_name,
+        content=content,
+        type=parent.type.value,
+    )
+
+
+def _parents_for(db: Session, messages: list[Message]) -> dict[int, "MessageParent"]:
+    """Batch-build parent previews for a list of messages.
+
+    Two queries total regardless of how many messages are in the
+    page: one to fetch all parent rows by `id`, one to fetch all
+    the corresponding senders. Messages with no `parent_id` (or
+    with a dangling one) are silently absent from the result.
+    """
+    parent_ids = {m.parent_id for m in messages if m.parent_id is not None}
+    if not parent_ids:
+        return {}
+
+    parents = {
+        p.id: p
+        for p in db.execute(
+            select(Message).where(Message.id.in_(parent_ids))
+        ).scalars()
+    }
+    sender_ids = {p.sender_id for p in parents.values()}
+    senders = {
+        u.id: u
+        for u in db.execute(
+            select(User).where(User.id.in_(sender_ids))
+        ).scalars()
+    } if sender_ids else {}
+
+    previews: dict[int, MessageParent] = {}
+    for child in messages:
+        if child.parent_id is None or child.parent_id not in parents:
+            continue
+        parent = parents[child.parent_id]
+        sender = senders.get(parent.sender_id)
+        sender_name = (
+            sender.display_name
+            if sender and sender.display_name
+            else (sender.phone if sender else None)
+        )
+        if parent.type == MessageType.IMAGE:
+            content = _PARENT_IMAGE_SENTINEL
+        elif parent.type == MessageType.SYSTEM:
+            content = _truncate_preview(parent.content, limit=60)
+        else:
+            content = _truncate_preview(parent.content)
+        previews[child.id] = MessageParent(
+            id=parent.id,
+            sender_id=parent.sender_id,
+            sender_name=sender_name,
+            content=content,
+            type=parent.type.value,
+        )
+    return previews
+
+
+# Phase 8.2: reactions. Cap the `users` list inside each
+# `ReactionGroup` at this many entries; `count` is always the full
+# total so the frontend can render "+N" for the overflow.
+_REACTION_USERS_CAP = 10
+
+
+def _reactions_for(
+    db: Session, message_ids: list[int]
+) -> dict[int, list[ReactionGroup]]:
+    """Batch-build reaction groups for a set of message ids.
+
+    One JOIN query: `message_reactions` joined to `users`, ordered
+    by `(message_id, emoji, created_at)` so each group sees users
+    in chronological order. The `users` field on each `ReactionGroup`
+    is capped at `_REACTION_USERS_CAP`; the `count` field reflects
+    the total.
+
+    Messages with no reactions are simply absent from the result;
+    callers default to `[]` via `dict.get(mid, [])`.
+    """
+    if not message_ids:
+        return {}
+
+    rows = db.execute(
+        select(MessageReaction.message_id, MessageReaction.emoji, User)
+        .join(User, User.id == MessageReaction.user_id)
+        .where(MessageReaction.message_id.in_(message_ids))
+        .order_by(
+            MessageReaction.message_id.asc(),
+            MessageReaction.emoji.asc(),
+            MessageReaction.created_at.asc(),
+            MessageReaction.user_id.asc(),
+        )
+    ).all()
+
+    # Build (message_id -> emoji -> ReactionGroup) so we can cap
+    # users while still incrementing count.
+    by_msg: dict[int, dict[str, ReactionGroup]] = {}
+    for mid, emoji, user in rows:
+        msg_groups = by_msg.setdefault(mid, {})
+        group = msg_groups.get(emoji)
+        if group is None:
+            group = ReactionGroup(emoji=emoji, count=0, users=[])
+            msg_groups[emoji] = group
+        group.count += 1
+        if len(group.users) < _REACTION_USERS_CAP:
+            group.users.append(
+                ReactionUser(
+                    id=user.id,
+                    display_name=user.display_name,
+                    avatar_url=user.avatar_url,
+                )
+            )
+
+    return {mid: list(groups.values()) for mid, groups in by_msg.items()}
+
+
+def _reactions_for_message(db: Session, message_id: int) -> list[ReactionGroup]:
+    """Single-message variant of `_reactions_for` for the POST/DELETE endpoints."""
+    return _reactions_for(db, [message_id]).get(message_id, [])
 
 
 def _emit_system_message(
@@ -168,13 +365,19 @@ def list_messages(
     if not msgs:
         return []
 
-    # Batch-load senders + attachments to avoid N+1 on the chat pane.
+    # Batch-load senders + attachments + seen_by + parents + reactions
+    # to avoid N+1 on the chat pane. 6 queries total: messages, senders,
+    # attachments, message_status+users (for seen_by), parents,
+    # message_reactions+users (for reactions).
     sender_ids = {m.sender_id for m in msgs}
     senders = {
         u.id: u
         for u in db.execute(select(User).where(User.id.in_(sender_ids))).scalars()
     }
     message_ids = [m.id for m in msgs]
+    seen_by_map = _seen_by_for(db, message_ids)
+    parents_map = _parents_for(db, msgs)
+    reactions_map = _reactions_for(db, message_ids)
     attachments_by_msg: dict[int, list[Attachment]] = {}
     for att in db.execute(
         select(Attachment).where(Attachment.message_id.in_(message_ids))
@@ -199,11 +402,15 @@ def list_messages(
                 type=m.type.value,
                 created_at=m.created_at,
                 parent_id=m.parent_id,
+                disappear_after_seconds=m.disappear_after_seconds,
                 sender=_user_out(sender),
                 attachments=[
                     AttachmentOut.model_validate(a)
                     for a in attachments_by_msg.get(m.id, [])
                 ],
+                seen_by=seen_by_map.get(m.id, []),
+                parent=parents_map.get(m.id),
+                reactions=reactions_map.get(m.id, []),
             )
         )
     return out
@@ -215,7 +422,10 @@ def list_messages(
 class SendMessageIn(BaseModel):
     content: str = Field(min_length=1, max_length=10_000)
     type: str = Field(default="text", description="text | image | system")
-    parent_id: Optional[int] = Field(default=None, description="Phase 8 reply; accepted but not surfaced yet")
+    parent_id: Optional[int] = Field(
+        default=None,
+        description="Phase 8.1: id of the message being replied to. Must be in the same conversation.",
+    )
 
 
 def _build_message_out(db: Session, m: Message) -> MessageOut:
@@ -223,6 +433,12 @@ def _build_message_out(db: Session, m: Message) -> MessageOut:
 
     Used by the send endpoint and by the WS broadcast — kept here so
     the two stay in lockstep.
+
+    For a freshly-sent message, `seen_by` is `[]` (no one has read
+    it yet). The field is still populated explicitly via the batch
+    helper so the WS `message.new` payload matches the GET shape
+    exactly. `parent` is built via `_parent_preview` (1-row variant)
+    so a reply's WS broadcast also carries the parent preview.
     """
     sender = db.get(User, m.sender_id)
     attachments = list(
@@ -230,6 +446,9 @@ def _build_message_out(db: Session, m: Message) -> MessageOut:
             select(Attachment).where(Attachment.message_id == m.id)
         ).scalars()
     )
+    seen_by_map = _seen_by_for(db, [m.id])
+    parent_preview = _parent_preview(db, m)
+    reactions = _reactions_for(db, [m.id]).get(m.id, [])
     return MessageOut(
         id=m.id,
         conversation_id=m.conversation_id,
@@ -238,8 +457,12 @@ def _build_message_out(db: Session, m: Message) -> MessageOut:
         type=m.type.value,
         created_at=m.created_at,
         parent_id=m.parent_id,
+        disappear_after_seconds=m.disappear_after_seconds,
         sender=_user_out(sender) if sender else UserOut.model_validate(_empty_user()),
         attachments=[AttachmentOut.model_validate(a) for a in attachments],
+        seen_by=seen_by_map.get(m.id, []),
+        parent=parent_preview,
+        reactions=reactions,
     )
 
 
@@ -274,8 +497,28 @@ async def send_message(
     if not service.user_is_participant(db, conversation_id, current_user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
 
+    # Validate parent_id (Phase 8.1): must reference a real message in
+    # the SAME conversation. Otherwise the reply's quoted preview
+    # would point at a foreign message and the chat-pane render
+    # would be incoherent.
+    if payload.parent_id is not None:
+        parent = db.get(Message, payload.parent_id)
+        if parent is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="parent message not found",
+            )
+        if parent.conversation_id != conversation_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="parent message is in a different conversation",
+            )
+
     # Persist the message. We set created_at explicitly so the timeline
     # and last_message_at land on the exact same instant.
+    # Phase 8.4: copy the conversation's disappearing timer onto the
+    # new message. Per spec, the value is captured at send time so a
+    # later timer change doesn't retroactively affect this message.
     now = datetime.now(timezone.utc)
     msg = Message(
         conversation_id=conversation_id,
@@ -284,11 +527,13 @@ async def send_message(
         type=payload.type,
         parent_id=payload.parent_id,
         created_at=now,
+        disappear_after_seconds=conv.disappear_after_seconds,
     )
     db.add(msg)
     db.flush()  # so msg.id is populated
 
-    # Non-sender participants get a `delivered` status row.
+    # A recipient is delivered only when they have a live WebSocket
+    # connection. Otherwise this stays `sent` until they reconnect.
     participant_rows = list(
         db.execute(
             select(ConversationParticipant.user_id).where(
@@ -297,12 +542,20 @@ async def send_message(
             )
         )
     )
+    delivered_ids: list[int] = []
     for (uid,) in participant_rows:
+        is_online = connection_manager.is_online(uid)
+        if is_online:
+            delivered_ids.append(uid)
         db.add(
             MessageStatus(
                 message_id=msg.id,
                 user_id=uid,
-                status=MessageStatusState.DELIVERED,
+                status=(
+                    MessageStatusState.DELIVERED
+                    if is_online
+                    else MessageStatusState.SENT
+                ),
             )
         )
 
@@ -323,6 +576,18 @@ async def send_message(
         participant_ids=participant_ids,
         payload=broadcast,
     )
+    for recipient_id in delivered_ids:
+        delivered_event: MessageDeliveredEvent = {
+            "type": "message.delivered",
+            "conversation_id": conversation_id,
+            "message_id": msg.id,
+            "delivered_to": recipient_id,
+        }
+        await connection_manager.broadcast_to_conversation(
+            conversation_id=conversation_id,
+            participant_ids=participant_ids,
+            payload=delivered_event,
+        )
 
     return out
 
@@ -453,14 +718,37 @@ def get_message_status(
         )
 
     rows = db.execute(
-        select(MessageStatus.message_id, MessageStatus.status).where(
-            MessageStatus.user_id == current_user.id,
-            MessageStatus.message_id.in_(ids),
+        select(
+            Message.id,
+            Message.sender_id,
+            MessageStatus.user_id,
+            MessageStatus.status,
         )
+        .join(MessageStatus, MessageStatus.message_id == Message.id)
+        .where(Message.conversation_id == conversation_id, Message.id.in_(ids))
     ).all()
-    # Status is stored as the enum; surface the .value so the
-    # frontend gets the string it sent in.
-    return {mid: state.value for (mid, state) in rows}
+
+    # Incoming messages expose this user's own delivery/read state.
+    # For outgoing messages, aggregate recipient states using the least
+    # advanced state so a group message reaches `read` only when every
+    # recipient has seen it.
+    result: dict[int, str] = {}
+    outgoing: dict[int, list[MessageStatusState]] = {}
+    rank = {
+        MessageStatusState.SENDING: 0,
+        MessageStatusState.SENT: 1,
+        MessageStatusState.DELIVERED: 2,
+        MessageStatusState.READ: 3,
+    }
+    for message_id, sender_id, recipient_id, state in rows:
+        if sender_id == current_user.id:
+            outgoing.setdefault(message_id, []).append(state)
+        elif recipient_id == current_user.id:
+            result[message_id] = state.value
+
+    for message_id, recipient_states in outgoing.items():
+        result[message_id] = min(recipient_states, key=rank.__getitem__).value
+    return result
 
 
 # --- POST /conversations (group create) ----------------------------------
@@ -923,4 +1211,300 @@ async def delete_conversation(
         payload=payload,
     )
 
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- /conversations/{id}/disappearing-timer (Phase 8.4) -------------------
+
+
+# Allowed timer values (seconds) + null to disable. A hardcoded enum
+# rather than "any positive int" because the UI presents these as
+# discrete choices (1h / 1d / 1w); letting any value through would
+# invite typos like 36000 (10h) that the user didn't mean.
+ALLOWED_DISAPPEAR_AFTER_SECONDS: set[int | None] = {1, 3600, 86400, 604800, None}
+
+
+class DisappearingTimerIn(BaseModel):
+    disappear_after_seconds: Any = Field(
+        description="1 (test/demo) / 3600 (1h) / 86400 (1d) / 604800 (1w) / null (disable).",
+    )
+
+
+class DisappearingTimerOut(BaseModel):
+    disappear_after_seconds: Optional[int] = None
+
+
+@router.patch(
+    "/conversations/{conversation_id}/disappearing-timer",
+    response_model=DisappearingTimerOut,
+)
+async def set_disappearing_timer(
+    conversation_id: int,
+    payload: DisappearingTimerIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DisappearingTimerOut:
+    """Set or clear the per-conversation disappearing-message timer.
+
+    Works for both direct and group conversations; membership is
+    the only authorization. New messages sent in this conversation
+    copy the value at send time, so a setting change only affects
+    future messages.
+    """
+    timer = payload.disappear_after_seconds
+    if timer is not None and (type(timer) is not int or timer not in ALLOWED_DISAPPEAR_AFTER_SECONDS):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"disappear_after_seconds must be one of "
+            f"{sorted(v for v in ALLOWED_DISAPPEAR_AFTER_SECONDS if v is not None)} or null",
+        )
+
+    conv = db.get(Conversation, conversation_id)
+    if conv is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="conversation not found",
+        )
+    if not service.user_is_participant(db, conversation_id, current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="not a participant",
+        )
+
+    conv.disappear_after_seconds = timer
+    db.commit()
+    db.refresh(conv)
+
+    # Broadcast conversation.updated so all participants refresh
+    # (and the chat-pane header can show the new timer).
+    participant_ids = [
+        uid
+        for (uid,) in db.execute(
+            select(ConversationParticipant.user_id).where(
+                ConversationParticipant.conversation_id == conversation_id
+            )
+        ).all()
+    ]
+    payload_out: dict = {
+        "type": "conversation.updated",
+        "conversation": service.to_conversation_out(
+            db, conv, current_user_id=current_user.id
+        ).model_dump(mode="json"),
+    }
+    await connection_manager.broadcast_to_conversation(
+        conversation_id=conversation_id,
+        participant_ids=participant_ids,
+        payload=payload_out,
+    )
+    return DisappearingTimerOut(
+        disappear_after_seconds=conv.disappear_after_seconds
+    )
+
+
+@router.get(
+    "/conversations/{conversation_id}/disappearing-timer",
+    response_model=DisappearingTimerOut,
+)
+def get_disappearing_timer(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DisappearingTimerOut:
+    """Return the current timer for the chat-pane header."""
+    conv = db.get(Conversation, conversation_id)
+    if conv is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="conversation not found",
+        )
+    if not service.user_is_participant(db, conversation_id, current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="not a participant",
+        )
+    return DisappearingTimerOut(
+        disappear_after_seconds=conv.disappear_after_seconds
+    )
+
+
+# --- /messages/{id}/reactions (Phase 8.2) ---------------------------------
+
+
+# Re-use `_require_group` would be wrong here: reactions work for
+# direct conversations too. Inline the membership check instead.
+
+
+class AddReactionIn(BaseModel):
+    # Pydantic-level length check would return 422; the spec mandates
+    # 400 for invalid length, so we validate in the route handler
+    # and let the route-level check win.
+    emoji: str = Field(description="Single emoji, e.g. '👍' or '❤️'. DB column is VARCHAR(16).")
+
+
+@router.post(
+    "/messages/{message_id}/reactions",
+    response_model=ReactionGroup,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_reaction(
+    message_id: int,
+    payload: AddReactionIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ReactionGroup:
+    """React to a message with an emoji.
+
+    201 with the new `ReactionGroup` for this emoji on success.
+    400 if the emoji is empty or > 16 chars.
+    404 if the message doesn't exist or the caller isn't a participant.
+    409 if the caller has already reacted with this emoji (idempotent
+    for the frontend — they can treat 409 as "already reacted").
+
+    Side effect: broadcasts `reactions.update` with the full new
+    list of reaction groups to all conversation participants.
+    """
+    # Pydantic enforces length, but validate again in case a client
+    # bypassed the schema (e.g. via `model_validate` directly).
+    if not payload.emoji or len(payload.emoji) > 16:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="emoji must be 1-16 chars",
+        )
+
+    msg = db.get(Message, message_id)
+    if msg is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="message not found",
+        )
+    if not service.user_is_participant(db, msg.conversation_id, current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="not a participant",
+        )
+
+    # Idempotency: check before insert so we can return 409 cleanly
+    # instead of letting the UNIQUE constraint raise.
+    existing = db.execute(
+        select(MessageReaction).where(
+            MessageReaction.message_id == message_id,
+            MessageReaction.user_id == current_user.id,
+            MessageReaction.emoji == payload.emoji,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="already reacted with this emoji",
+        )
+
+    db.add(
+        MessageReaction(
+            message_id=message_id,
+            user_id=current_user.id,
+            emoji=payload.emoji,
+        )
+    )
+    db.commit()
+
+    # Build the ReactionGroup for the new emoji from the fresh state.
+    groups = _reactions_for_message(db, message_id)
+    new_group = next((g for g in groups if g.emoji == payload.emoji), None)
+    if new_group is None:
+        # Defensive: the insert just succeeded; the group must exist.
+        # If it doesn't, the DB is in an unexpected state.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="reaction inserted but not found",
+        )
+
+    # Broadcast the full updated list to all participants.
+    participant_ids = [
+        uid
+        for (uid,) in db.execute(
+            select(ConversationParticipant.user_id).where(
+                ConversationParticipant.conversation_id == msg.conversation_id
+            )
+        ).all()
+    ]
+    payload_out: dict = {
+        "type": "reactions.update",
+        "conversation_id": msg.conversation_id,
+        "message_id": message_id,
+        "reactions": [g.model_dump(mode="json") for g in groups],
+    }
+    await connection_manager.broadcast_to_conversation(
+        conversation_id=msg.conversation_id,
+        participant_ids=participant_ids,
+        payload=payload_out,
+    )
+    return new_group
+
+
+@router.delete(
+    "/messages/{message_id}/reactions/{emoji}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def remove_reaction(
+    message_id: int,
+    emoji: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Remove the caller's reaction with `emoji` from the message.
+
+    204 on success. 404 if the message doesn't exist, the caller
+    isn't a participant, or the caller has no such reaction.
+    Idempotent: a no-op delete is also 404.
+    """
+    msg = db.get(Message, message_id)
+    if msg is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="message not found",
+        )
+    if not service.user_is_participant(db, msg.conversation_id, current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="not a participant",
+        )
+
+    existing = db.execute(
+        select(MessageReaction).where(
+            MessageReaction.message_id == message_id,
+            MessageReaction.user_id == current_user.id,
+            MessageReaction.emoji == emoji,
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="no such reaction",
+        )
+
+    db.delete(existing)
+    db.commit()
+
+    # Broadcast the full updated list (now without this emoji) to
+    # all participants.
+    participant_ids = [
+        uid
+        for (uid,) in db.execute(
+            select(ConversationParticipant.user_id).where(
+                ConversationParticipant.conversation_id == msg.conversation_id
+            )
+        ).all()
+    ]
+    groups = _reactions_for_message(db, message_id)
+    payload_out: dict = {
+        "type": "reactions.update",
+        "conversation_id": msg.conversation_id,
+        "message_id": message_id,
+        "reactions": [g.model_dump(mode="json") for g in groups],
+    }
+    await connection_manager.broadcast_to_conversation(
+        conversation_id=msg.conversation_id,
+        participant_ids=participant_ids,
+        payload=payload_out,
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

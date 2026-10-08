@@ -39,6 +39,7 @@ from app.models import (
 )
 from app.realtime import connection_manager
 from app.realtime.events import (
+    MessageDeliveredEvent,
     MessageReadEvent,
     PresenceEvent,
     PresenceSnapshot,
@@ -91,6 +92,56 @@ def _participant_ids(db, conversation_id: int) -> list[int]:
         )
     ).all()
     return [r[0] for r in rows]
+
+
+async def _mark_pending_messages_delivered(user_id: int) -> None:
+    """Advance offline messages to delivered when a recipient reconnects.
+
+    The recipient's conversation history is fetched by the client after
+    connecting; this status transition tells senders that the recipient
+    is online and can receive the messages.
+    """
+    db = _db_session()
+    try:
+        pending = db.execute(
+            select(MessageStatus, Message)
+            .join(Message, Message.id == MessageStatus.message_id)
+            .where(
+                MessageStatus.user_id == user_id,
+                MessageStatus.status == MessageStatusState.SENT,
+            )
+        ).all()
+        if not pending:
+            return
+
+        now = datetime.now(timezone.utc)
+        delivered: list[tuple[int, int]] = []
+        for status_row, message in pending:
+            status_row.status = MessageStatusState.DELIVERED
+            status_row.updated_at = now
+            delivered.append((message.id, message.conversation_id))
+        db.commit()
+
+        by_conversation: dict[int, list[int]] = {}
+        for message_id, conversation_id in delivered:
+            by_conversation.setdefault(conversation_id, []).append(message_id)
+
+        for conversation_id, message_ids in by_conversation.items():
+            participants = _participant_ids(db, conversation_id)
+            for message_id in message_ids:
+                event: MessageDeliveredEvent = {
+                    "type": "message.delivered",
+                    "conversation_id": conversation_id,
+                    "message_id": message_id,
+                    "delivered_to": user_id,
+                }
+                await connection_manager.broadcast_to_conversation(
+                    conversation_id=conversation_id,
+                    participant_ids=participants,
+                    payload=event,
+                )
+    finally:
+        db.close()
 
 
 # --- Typing-expiry hook --------------------------------------------------
@@ -183,6 +234,10 @@ async def websocket_endpoint(
     # able to receive its own `message.new` — see the UI-send race
     # note in `manager.py` (READY_WAIT_SECONDS).
     connection_manager.mark_ready(user.id)
+
+    # Messages sent while this user was offline move from single-tick
+    # `sent` to double-tick `delivered` as soon as they reconnect.
+    await _mark_pending_messages_delivered(user.id)
 
     # --- 3. Reader loop -----------------------------------------------
     try:

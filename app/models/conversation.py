@@ -38,6 +38,14 @@ class Conversation(Base):
     last_message_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), index=True, nullable=True
     )
+    # Phase 8.4: per-conversation default for disappearing messages.
+    # NULL = messages persist forever. New messages copy this value
+    # at send time, so a setting change doesn't retroactively affect
+    # existing messages. The allowed values are validated at the
+    # route layer (3600/86400/604800 or null).
+    disappear_after_seconds: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
 
 
 class ConversationParticipant(Base):

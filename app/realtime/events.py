@@ -49,6 +49,13 @@ class MessageNewEvent(BaseEvent):
     message: dict  # a MessageOut-shaped dict
 
 
+class MessageDeliveredEvent(BaseEvent):
+    type: str  # "message.delivered"
+    conversation_id: int
+    message_id: int
+    delivered_to: int
+
+
 class MessageReadEvent(BaseEvent):
     type: str  # "message.read" — single message (from WS client message.read)
     message_id: int
