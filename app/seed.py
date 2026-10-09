@@ -612,6 +612,12 @@ def _seed(db: Session) -> None:
     for msg in (
         db.query(Message).all()
     ):
+        # SQLite drops timezone metadata from DateTime(timezone=True) values.
+        # Seed timestamps are UTC, so restore UTC before comparing them with
+        # the timezone-aware cutoff. Postgres values remain unchanged.
+        created_at = msg.created_at
+        if created_at is not None and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
         sender = msg.sender_id
         for p in (
             db.query(ConversationParticipant)
@@ -626,7 +632,7 @@ def _seed(db: Session) -> None:
                 user_id=p.user_id,
                 state=(
                     MessageStatusState.READ
-                    if msg.created_at and msg.created_at >= read_cutoff
+                    if created_at and created_at >= read_cutoff
                     else MessageStatusState.DELIVERED
                 ),
             )
