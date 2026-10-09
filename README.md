@@ -170,6 +170,7 @@ All routes below require `Authorization: Bearer <token>` (the JWT issued by `/au
 | `PATCH` | `/conversations/{id}/avatar` | ✅ | Admin-only. Update or clear group photo; broadcasts the change. |
 | `POST` | `/conversations/{id}/members` | ✅ | Admin-only. Add user. |
 | `DELETE` | `/conversations/{id}/members/{user_id}` | ✅ | Admin-only. Remove user and notify their connected clients. |
+| `POST` | `/conversations/{id}/leave` | ✅ | Current member leaves the group; a group cannot be left by its last admin. |
 | `PATCH` | `/conversations/{id}/members/{user_id}` | ✅ | Admin-only. Change role. |
 | `DELETE` | `/conversations/{id}` | ✅ | Admin-only. Cascade-delete the group. |
 | `GET` | `/contacts` | ✅ | Current user's contacts, newest first. |
@@ -310,9 +311,10 @@ Emoji storage is UTF-8 round-trip safe. `sqlite3 app.db "SELECT hex(emoji) FROM 
 
 `POST /conversations` with `type:"group"` creates a group; the caller becomes the first admin. The caller's id is **silently deduped** from `member_ids` if present (UI flows naturally include the caller when picking members). Duplicate ids are dropped. Only ids that don't correspond to a real user still trigger a 403.
 
-Member management is admin-only:
+Member management is admin-only, except that any member may leave their own group membership:
 - `POST /conversations/{id}/members` — add
 - `DELETE /conversations/{id}/members/{uid}` — remove (400 if last admin leaving)
+- `POST /conversations/{id}/leave` — leave as the authenticated member (400 if the caller is the last admin)
 - `PATCH /conversations/{id}/members/{uid}` — change role
 - `DELETE /conversations/{id}` — delete the group (cascades)
 

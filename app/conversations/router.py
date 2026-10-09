@@ -1206,8 +1206,45 @@ async def remove_member(
       The spec calls for "must promote another member first or
       delete the group"; we return 400 with that message.
     """
+    return await _remove_group_participant(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        actor=current_user,
+        db=db,
+        require_admin=True,
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/leave",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def leave_group(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Leave as the authenticated group member; the last admin cannot leave."""
+    return await _remove_group_participant(
+        conversation_id=conversation_id,
+        user_id=current_user.id,
+        actor=current_user,
+        db=db,
+        require_admin=False,
+    )
+
+
+async def _remove_group_participant(
+    *,
+    conversation_id: int,
+    user_id: int,
+    actor: User,
+    db: Session,
+    require_admin: bool,
+) -> Response:
     conv = _require_group(db, conversation_id)
-    _require_admin(db, conversation_id, current_user.id)
+    if require_admin:
+        _require_admin(db, conversation_id, actor.id)
 
     cp = db.execute(
         select(ConversationParticipant).where(
@@ -1252,11 +1289,11 @@ async def remove_member(
     # on whether the sender is the same as the subject.
     target = db.get(User, user_id)
     sys_content = (target.display_name or target.phone) if target else "user"
-    actor = user_id if user_id == current_user.id else current_user.id
+    actor_id = user_id if user_id == actor.id else actor.id
     sys_msg = _emit_system_message(
         db,
         conversation_id=conversation_id,
-        sender_id=actor,
+        sender_id=actor_id,
         content=sys_content,
         participant_ids=participant_ids,
     )
@@ -1277,7 +1314,7 @@ async def remove_member(
     conv_payload: dict = {
         "type": "conversation.updated",
         "conversation": service.to_conversation_out(
-            db, conv, current_user_id=current_user.id
+            db, conv, current_user_id=actor.id
         ).model_dump(mode="json"),
     }
     await connection_manager.broadcast_to_conversation(

@@ -6,6 +6,7 @@ at startup. Anything new that needs to be tunable belongs here.
 """
 
 from functools import lru_cache
+from pathlib import Path
 from typing import List
 
 from pydantic import Field
@@ -46,7 +47,10 @@ class Settings(BaseSettings):
     )
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # Resolve from the backend project, not the shell's current
+        # directory, so launching uvicorn from the repo root still loads
+        # backend/.env. Process environment variables retain precedence.
+        env_file=Path(__file__).resolve().parents[1] / ".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
