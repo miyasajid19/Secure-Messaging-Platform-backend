@@ -192,7 +192,7 @@ def to_conversation_out(
 
     is_group = conv.type.value == "group"
     if is_group:
-        avatar = group_avatar_url(conv)
+        avatar = conv.avatar_url or group_avatar_url(conv)
     else:
         avatar = direct_avatar_url(db, conv.id, current_user_id)
 

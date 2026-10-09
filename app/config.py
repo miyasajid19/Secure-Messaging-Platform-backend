@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     jwt_expires_minutes: int = Field(default=60 * 24 * 7)  # 7 days
     jwt_issuer: str = Field(default="signal-clone")
 
+    # ImageKit private key is used only by the authenticated backend upload
+    # endpoint. Never expose it through a NEXT_PUBLIC variable.
+    imagekit_private_key: str = Field(default="")
+
     # --- CORS -------------------------------------------------------------
     # Comma-separated string in .env, parsed into a list here.
     cors_origins: str = Field(

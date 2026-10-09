@@ -38,7 +38,7 @@ log = logging.getLogger("main")
 
 
 def _migrate_phase_8_4(engine) -> None:
-    """Idempotent ALTER TABLE for the new `conversations.disappear_after_seconds` column.
+    """Add columns introduced after the initial conversation schema.
 
     `create_all` only creates missing tables, not missing columns on
     existing tables. For dev/demo we run a one-shot check + ALTER
@@ -51,6 +51,11 @@ def _migrate_phase_8_4(engine) -> None:
         if "disappear_after_seconds" not in cols:
             conn.execute(
                 text("ALTER TABLE conversations ADD COLUMN disappear_after_seconds INTEGER")
+            )
+            conn.commit()
+        if "avatar_url" not in cols:
+            conn.execute(
+                text("ALTER TABLE conversations ADD COLUMN avatar_url VARCHAR(512)")
             )
             conn.commit()
 

@@ -38,9 +38,9 @@ class ConversationOut(BaseModel):
     """One row in the conversation list.
 
     `participants` is included so the Phase 6 group admin UI can render
-    member chips without a second round-trip. `avatar_url` is computed:
-    for direct convos it's the other person's avatar; for groups it's a
-    DiceBear initials URL derived from the name.
+    member chips without a second round-trip. `avatar_url` is computed
+    for direct convos and uses the configured group photo or a DiceBear
+    initials URL for groups.
 
     Phase 6 additions:
     - `members_can_be_added`: True for groups (UI shows "Add member"),

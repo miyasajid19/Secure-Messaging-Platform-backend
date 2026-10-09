@@ -582,6 +582,15 @@ All settings live in `app/config.py` and are read from the environment or
 | `JWT_EXPIRES_MINUTES`| `10080` (7 days)                 | Token TTL. |
 | `JWT_ISSUER`         | `signal-clone`                   | `iss` claim. Tokens with a different `iss` are rejected. |
 | `CORS_ORIGINS`       | `http://localhost:3000`          | Comma-separated. Add the prod frontend host when deploying. |
+| `IMAGEKIT_PRIVATE_KEY` | (empty)                         | ImageKit server-side upload key. Required for chat attachments; keep secret. |
+
+## Chat attachments
+
+Set `IMAGEKIT_PRIVATE_KEY` in the backend `.env` to enable the paperclip in
+the chat composer. Files (up to 10 per message, 25 MB each, 50 MB total) upload through
+the authenticated backend to ImageKit; the private key is never sent to the
+browser. Images appear inline, and other file types appear as downloadable
+attachment rows. SVG files are rejected to avoid serving active content.
 
 ## Project layout
 

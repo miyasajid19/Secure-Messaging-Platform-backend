@@ -1,8 +1,8 @@
 """Emoji reactions on messages (Phase 8 bonus).
 
-UNIQUE(message_id, user_id, emoji) means a user can leave multiple distinct
-emoji on the same message but only one of each kind. Re-reacting with the
-same emoji is a no-op at the application layer.
+The API replaces a user's previous emoji when they choose a different one.
+The database uniqueness constraint also prevents duplicate copies of the
+same emoji from a user on a message.
 """
 
 from datetime import datetime

@@ -11,13 +11,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from pydantic import BaseModel, Field
-from sqlalchemy import func, select, update
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.auth.deps import get_current_user
 from app.conversations import service
+from app.config import get_settings
 from app.database import get_db
 from app.models import (
     Attachment,
@@ -124,7 +125,7 @@ def _parent_preview(db: Session, m: Message) -> Optional["MessageParent"]:
     elif parent.type == MessageType.SYSTEM:
         content = _truncate_preview(parent.content, limit=60)
     else:
-        content = _truncate_preview(parent.content)
+        content = _truncate_preview(parent.content) or "📎 Attachment"
 
     return MessageParent(
         id=parent.id,
@@ -177,7 +178,7 @@ def _parents_for(db: Session, messages: list[Message]) -> dict[int, "MessagePare
         elif parent.type == MessageType.SYSTEM:
             content = _truncate_preview(parent.content, limit=60)
         else:
-            content = _truncate_preview(parent.content)
+            content = _truncate_preview(parent.content) or "📎 Attachment"
         previews[child.id] = MessageParent(
             id=parent.id,
             sender_id=parent.sender_id,
@@ -419,13 +420,95 @@ def list_messages(
 # --- /conversations/{id}/messages (POST) ---------------------------------
 
 
+class AttachmentIn(BaseModel):
+    url: str = Field(min_length=1, max_length=1024)
+    mime: str = Field(min_length=1, max_length=128)
+    size_bytes: int = Field(ge=1, le=25 * 1024 * 1024)
+
+
 class SendMessageIn(BaseModel):
-    content: str = Field(min_length=1, max_length=10_000)
+    content: str = Field(default="", max_length=10_000)
     type: str = Field(default="text", description="text | image | system")
     parent_id: Optional[int] = Field(
         default=None,
         description="Phase 8.1: id of the message being replied to. Must be in the same conversation.",
     )
+    attachments: list[AttachmentIn] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def require_content_or_attachment(self):
+        if not self.content.strip() and not self.attachments:
+            raise ValueError("message content or at least one attachment is required")
+        return self
+
+
+@router.post(
+    "/conversations/{conversation_id}/attachments",
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_message_attachments(
+    conversation_id: int,
+    files: list[UploadFile] = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Upload conversation attachments to ImageKit using the backend secret."""
+    conv = db.get(Conversation, conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    if not service.user_is_participant(db, conversation_id, current_user.id):
+        raise HTTPException(status_code=403, detail="not a participant")
+    if not files or len(files) > 10:
+        raise HTTPException(status_code=400, detail="choose between 1 and 10 files")
+    known_sizes = [upload.size for upload in files]
+    if any(size is not None and size > 25 * 1024 * 1024 for size in known_sizes):
+        raise HTTPException(status_code=413, detail="each file must be 25 MB or smaller")
+    if all(size is not None for size in known_sizes) and sum(known_sizes) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="attachments must total 50 MB or less")
+
+    private_key = get_settings().imagekit_private_key.strip()
+    if not private_key:
+        raise HTTPException(status_code=503, detail="file uploads are not configured")
+
+    import httpx
+    uploaded: list[dict[str, Any]] = []
+    total_size = 0
+    async with httpx.AsyncClient(timeout=60) as client:
+        for upload in files:
+            data = await upload.read(25 * 1024 * 1024 + 1)
+            if not data:
+                raise HTTPException(status_code=400, detail="empty files cannot be attached")
+            if len(data) > 25 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="each file must be 25 MB or smaller")
+            total_size += len(data)
+            if total_size > 50 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="attachments must total 50 MB or less")
+
+            mime = (upload.content_type or "application/octet-stream").split(";", 1)[0].lower()
+            if mime == "image/svg+xml":
+                raise HTTPException(status_code=400, detail="SVG attachments are not supported")
+            filename = (upload.filename or "attachment").replace("\\", "/").rsplit("/", 1)[-1]
+            filename = filename.replace("\x00", "")[:180] or "attachment"
+            try:
+                response = await client.post(
+                    "https://upload.imagekit.io/api/v1/files/upload",
+                    auth=(private_key, ""),
+                    data={"fileName": filename, "useUniqueFileName": "true"},
+                    files={"file": (filename, data, mime)},
+                )
+                response.raise_for_status()
+                result = response.json()
+                url = result.get("url")
+                if not isinstance(url, str) or not url.startswith("https://"):
+                    raise ValueError("ImageKit did not return a secure file URL")
+            except (httpx.HTTPError, ValueError) as exc:
+                detail = "Image upload failed"
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403):
+                    detail = "ImageKit rejected the upload credentials"
+                raise HTTPException(status_code=502, detail=detail) from exc
+
+            uploaded.append({"url": url, "mime": mime, "size_bytes": len(data)})
+    return uploaded
 
 
 def _build_message_out(db: Session, m: Message) -> MessageOut:
@@ -520,17 +603,40 @@ async def send_message(
     # new message. Per spec, the value is captured at send time so a
     # later timer change doesn't retroactively affect this message.
     now = datetime.now(timezone.utc)
+    for attachment in payload.attachments:
+        from urllib.parse import urlsplit
+
+        parsed_url = urlsplit(attachment.url)
+        if parsed_url.scheme != "https" or parsed_url.hostname != "ik.imagekit.io":
+            raise HTTPException(status_code=400, detail="attachment URL must be hosted by ImageKit")
+        if attachment.mime.lower() == "image/svg+xml":
+            raise HTTPException(status_code=400, detail="SVG attachments are not supported")
+
+    message_type = (
+        MessageType.IMAGE
+        if any(attachment.mime.startswith("image/") for attachment in payload.attachments)
+        else MessageType(payload.type)
+    )
     msg = Message(
         conversation_id=conversation_id,
         sender_id=current_user.id,
         content=payload.content,
-        type=payload.type,
+        type=message_type,
         parent_id=payload.parent_id,
         created_at=now,
         disappear_after_seconds=conv.disappear_after_seconds,
     )
     db.add(msg)
     db.flush()  # so msg.id is populated
+    for attachment in payload.attachments:
+        db.add(
+            Attachment(
+                message_id=msg.id,
+                url=attachment.url,
+                mime=attachment.mime,
+                size_bytes=attachment.size_bytes,
+            )
+        )
 
     # A recipient is delivered only when they have a live WebSocket
     # connection. Otherwise this stays `sent` until they reconnect.
@@ -757,6 +863,7 @@ def get_message_status(
 class CreateGroupIn(BaseModel):
     type: str = Field(default="group", description="Must be 'group' — direct uses POST /contacts")
     name: str = Field(min_length=1, max_length=128)
+    avatar_url: Optional[str] = Field(default=None, max_length=512)
     member_ids: List[int] = Field(
         default_factory=list,
         description="User ids to add. The caller's id is silently deduped (UI flows naturally include the caller).",
@@ -821,6 +928,7 @@ async def create_conversation(
     conv = Conversation(
         type=ConversationType.GROUP,
         name=payload.name,
+        avatar_url=payload.avatar_url,
         created_at=now,
         last_message_at=now,
     )
@@ -872,6 +980,30 @@ async def create_conversation(
     )
 
     return service.to_conversation_out(db, conv, current_user_id=current_user.id)
+
+
+class GroupAvatarIn(BaseModel):
+    avatar_url: Optional[str] = Field(default=None, max_length=512)
+
+
+@router.patch("/conversations/{conversation_id}/avatar")
+def update_group_avatar(
+    conversation_id: int,
+    payload: GroupAvatarIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Optional[str]]:
+    """Update or clear a group's photo. Only group admins can change it."""
+    conv = db.get(Conversation, conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    if conv.type != ConversationType.GROUP:
+        raise HTTPException(status_code=400, detail="only groups have a group photo")
+    _require_admin(db, conversation_id, current_user.id)
+    conv.avatar_url = payload.avatar_url
+    db.commit()
+    db.refresh(conv)
+    return {"avatar_url": conv.avatar_url}
 
 
 # --- POST /conversations/{id}/members -----------------------------------
@@ -1357,8 +1489,8 @@ async def add_reaction(
     201 with the new `ReactionGroup` for this emoji on success.
     400 if the emoji is empty or > 16 chars.
     404 if the message doesn't exist or the caller isn't a participant.
-    409 if the caller has already reacted with this emoji (idempotent
-    for the frontend — they can treat 409 as "already reacted").
+    409 if the caller has already reacted with this emoji. A different
+    existing reaction by the caller is replaced with the requested emoji.
 
     Side effect: broadcasts `reactions.update` with the full new
     list of reaction groups to all conversation participants.
@@ -1398,6 +1530,15 @@ async def add_reaction(
             detail="already reacted with this emoji",
         )
 
+    # Keep each user's reaction singular for this message. Deleting the
+    # prior choice in the same transaction means clients on any device
+    # see one consistent reaction, not just the optimistic local UI.
+    db.execute(
+        delete(MessageReaction).where(
+            MessageReaction.message_id == message_id,
+            MessageReaction.user_id == current_user.id,
+        )
+    )
     db.add(
         MessageReaction(
             message_id=message_id,

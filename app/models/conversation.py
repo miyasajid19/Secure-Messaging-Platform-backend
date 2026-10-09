@@ -28,6 +28,7 @@ class Conversation(Base):
     # NULL for direct conversations (the name is implicit — the other
     # participant's display name). Required for groups.
     name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    avatar_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False

@@ -16,12 +16,13 @@ for this milestone.
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.auth.deps import get_current_user
 from app.auth.jwt import encode_token
 from app.auth.otp import MOCK_OTP
@@ -154,6 +155,56 @@ def update_profile(
 
     db.refresh(current_user)
     return UserOut.model_validate(current_user)
+
+
+@router.post("/auth/upload-image", status_code=status.HTTP_201_CREATED)
+async def upload_image(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    """Upload an authenticated user's profile or group image to ImageKit."""
+    del current_user  # Authentication is required; profile update is a separate request.
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Choose an image to upload")
+
+    mime = (file.content_type or "application/octet-stream").split(";", 1)[0].lower()
+    if not mime.startswith("image/") or mime == "image/svg+xml":
+        raise HTTPException(status_code=400, detail="Choose a supported image file")
+
+    data = await file.read(5 * 1024 * 1024 + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty files cannot be uploaded")
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Images must be 5 MB or smaller")
+
+    private_key = get_settings().imagekit_private_key.strip()
+    if not private_key:
+        raise HTTPException(status_code=503, detail="Image uploads are not configured")
+
+    import httpx
+
+    filename = file.filename.replace("\\", "/").rsplit("/", 1)[-1]
+    filename = filename.replace("\x00", "")[:180] or "profile-photo"
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                "https://upload.imagekit.io/api/v1/files/upload",
+                auth=(private_key, ""),
+                data={"fileName": filename, "useUniqueFileName": "true"},
+                files={"file": (filename, data, mime)},
+            )
+            response.raise_for_status()
+            result = response.json()
+            url = result.get("url")
+            if not isinstance(url, str) or not url.startswith("https://"):
+                raise ValueError("ImageKit did not return a secure file URL")
+    except (httpx.HTTPError, ValueError) as exc:
+        detail = "Image upload failed"
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403):
+            detail = "ImageKit rejected the upload credentials"
+        raise HTTPException(status_code=502, detail=detail) from exc
+
+    return {"url": url}
 
 
 # --- /auth/logout --------------------------------------------------------
