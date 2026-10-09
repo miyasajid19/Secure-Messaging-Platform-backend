@@ -6,6 +6,9 @@ dist/
 wheels/
 *.egg-info/
 
+# Node (in case anyone runs npm scripts at the repo root)
+node_modules/
+
 # Virtual environments
 .venv
 
