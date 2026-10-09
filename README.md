@@ -1,4 +1,4 @@
-# Signal Clone — Backend
+# Secure Messaging Platform — Backend
 
 FastAPI + SQLAlchemy 2.x + SQLite (WAL) backend for the Signal Messenger clone assignment. Serves a REST API for auth, conversations, contacts, and message CRUD, plus a single WebSocket endpoint for real-time messaging, presence, typing, and reactions. Single uvicorn worker (locked decision — see below).
 
@@ -94,27 +94,6 @@ The Docker start command runs `python -m app.seed` before Uvicorn on every conta
 | `CORS_ORIGINS` | yes | `https://your-app.vercel.app` | Comma-separated. The Vercel domain only — don't allow `localhost` in prod. |
 | `IMAGEKIT_PRIVATE_KEY` | only for attachments | `<key>` | ImageKit server-side upload key for chat attachments. Optional — composer hides the paperclip if missing. |
 
-### Verify a live deploy
-
-```bash
-# 1. Health
-curl https://your-service.onrender.com/health
-# -> {"status":"ok","db":"reachable","counts":{...}}
-
-# 2. Auth (Sajid Miya is a seeded user; OTP is always 123456)
-TOKEN=$(curl -s -X POST https://your-service.onrender.com/auth/verify-otp \
-  -H 'Content-Type: application/json' \
-  -d '{"phone":"+919000000001","otp":"123456"}' \
-  | python -c "import sys,json; print(json.load(sys.stdin)['token'])")
-
-# 3. Conversations
-curl -s https://your-service.onrender.com/conversations \
-  -H "Authorization: Bearer $TOKEN"
-
-# 4. WS smoke: open the app in two browser windows and send a message between users
-```
-
-Open the deployed URL in two browser windows; log in as Sajid Miya and Aasif Miya (OTP `123456`); send a message from Sajid → it should appear in Aasif's window in under 1 s.
 
 ## Database schema
 
