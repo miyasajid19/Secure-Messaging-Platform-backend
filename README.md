@@ -31,11 +31,11 @@ Three layers:
 |---|---|---|
 | Framework | FastAPI 0.115+ | Async; built-in WebSocket support |
 | ORM | SQLAlchemy 2.x | Typed declarative (`Mapped[...]`, `mapped_column`) |
-| DB | SQLite 3 (WAL mode) | Single file on persistent block storage |
+| DB | SQLite 3 (WAL mode) | Single file on a Railway Volume mounted at `/data` |
 | Auth | PyJWT (HS256) | Stateless; expiry 7 days |
 | Realtime | FastAPI WebSocket + asyncio | In-memory pub/sub by conversation |
 | Python | 3.11+ | `.python-version` pinned |
-| Deploy | AWS EC2 | Single uvicorn worker; persistent EBS volume at `/data` |
+| Deploy | Railway | Single replica and worker; persistent Volume at `/data` |
 
 ## Quick start (local dev)
 
@@ -70,60 +70,15 @@ sqlite3 app.db "PRAGMA journal_mode;"
 # -> wal
 ```
 
-## Deployment (AWS EC2)
-
-The Docker image is suitable for a single EC2 instance. This matches the current runtime design: SQLite WAL needs persistent local block storage, and presence, typing, and WebSocket connections live in one process. Do not run multiple tasks/instances or put the SQLite database on EFS/NFS. If you need horizontal scaling or automatic replacement across instances, move to a client/server database and shared real-time state first.
-
-### Build and run
-
-1. Create an EC2 instance in a VPC, attach an encrypted EBS data volume, and mount it at `/srv/signal-data`. Keep the root volume separate so app redeploys do not affect database files. Give the mount directory to container UID `10001` (`sudo chown 10001:10001 /srv/signal-data`). Configure the EBS volume to mount at boot.
-2. Install Docker and clone this repository on the instance. From `backend/`, build the image with `docker build -t signal-backend:latest .`.
-3. Create an instance-local `/etc/signal-backend.env` file with mode `600` and these production values:
-
-   ```dotenv
-   DATABASE_URL=sqlite:////data/app.db
-   JWT_SECRET=<random 64-character secret>
-   JWT_ISSUER=signal-clone
-   CORS_ORIGINS=https://your-frontend-domain
-   # Optional, only when enabling attachment uploads:
-   IMAGEKIT_PRIVATE_KEY=<ImageKit private key>
-   ```
-
-   Generate a secret with `python -c "import secrets; print(secrets.token_hex(32))"`. Do not copy the development `.env` to the server or commit production secrets.
-4. Start the single container on the instance's private interface so a TLS-terminating load balancer or reverse proxy can reach it:
-
-   ```bash
-   docker run -d --name signal-backend --restart unless-stopped \
-     --env-file /etc/signal-backend.env \
-     -p 8000:8000 \
-     -v /srv/signal-data:/data \
-     signal-backend:latest
-   ```
-
-   For an Application Load Balancer, register the instance on port `8000` and use `/health` for its health check. Allow inbound application traffic only from the load balancer security group; terminate HTTPS on the load balancer and enable WebSocket pass-through. Do not expose port `8000` publicly.
-5. Verify `http://127.0.0.1:8000/health` on the instance, then verify the public HTTPS URL. On image updates, rebuild and recreate this container while keeping the same EBS mount and environment file.
-
-The Docker image runs one Uvicorn worker and has a `/health` container health check. Back up the EBS database volume regularly; a single EBS volume is persistent storage, not a backup. Keep the instance and volume in the same Availability Zone.
-
-### Production environment variables
-
-| Var | Required | Example | Notes |
-|---|---|---|---|
-| `DATABASE_URL` | yes | `sqlite:////data/app.db` | Path inside the container, backed by the EBS mount. |
-| `JWT_SECRET` | yes | `<random 64-character hex>` | Never use the development default in production. |
-| `JWT_ALGORITHM` | no | `HS256` | |
-| `JWT_EXPIRES_MINUTES` | no | `10080` | 7 days. |
-| `JWT_ISSUER` | no | `signal-clone` | `iss` claim; mismatched tokens are rejected. |
-| `CORS_ORIGINS` | yes | `https://your-app.example.com` | Comma-separated frontend origins. |
-| `IMAGEKIT_PRIVATE_KEY` | only for attachments | `<key>` | Optional ImageKit server-side upload key. |
-
 ## Deployment (Railway)
 
-### One-time setup
-1. Create a new Railway project → **Deploy from GitHub repo**.
-2. **Add a Volume** to the service, mount path `/data`, size 1 GB. This is what makes `app.db` survive redeploys. Without it the file is ephemeral and resets on every push.
-3. Set the service's start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1`. The `--workers 1` is **mandatory** (see [Known limitations](#known-limitations)).
-4. Configure env vars (see table below). At minimum set `JWT_SECRET` to a strong random value and `CORS_ORIGINS` to your Vercel frontend URL.
+Railway detects the repository-root `Dockerfile` and builds the service from it. Create a Railway project, deploy this GitHub repository as a service, and configure it as follows:
+
+1. Attach a persistent Volume to the backend service with mount path `/data`. The database URL below points to `/data/app.db`; without the Volume, database data is lost when the container is replaced. Railway mounts volumes as root, so set the service variable `RAILWAY_RUN_UID=0` to let the container write to the mounted directory.
+2. Keep the service to **one replica** and one Uvicorn worker. The connection manager and disappearing-message sweeper keep state in process memory.
+3. Set the production environment variables in Railway's service Variables tab. Do not copy the local `.env` file or use the development JWT secret.
+4. Set the service healthcheck path to `/health` and generate a public domain under Networking. Railway supplies `PORT`; the Dockerfile listens on it.
+5. Deploy and check the service logs, then open `https://<your-domain>/health` to confirm the database is reachable.
 
 ### Env vars (production)
 
