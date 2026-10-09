@@ -80,6 +80,8 @@ Railway detects the repository-root `Dockerfile` and builds the service from it.
 4. Set the service healthcheck path to `/health` and generate a public domain under Networking. Railway supplies `PORT`; the Dockerfile listens on it.
 5. Deploy and check the service logs, then open `https://<your-domain>/health` to confirm the database is reachable.
 
+The Docker start command runs `python -m app.seed` before Uvicorn. The seed script checks for its demo-user sentinel and does nothing when the database is already seeded, so restarts and redeploys do not duplicate the demo data. The `/data` Volume must be attached for this seed data to persist.
+
 ### Env vars (production)
 
 | Var | Required | Example | Notes |
