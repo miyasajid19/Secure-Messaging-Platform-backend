@@ -101,10 +101,10 @@ The Docker start command runs `python -m app.seed` before Uvicorn on every conta
 curl https://your-service.onrender.com/health
 # -> {"status":"ok","db":"reachable","counts":{...}}
 
-# 2. Auth (Alice is a seeded user; OTP is always 123456)
+# 2. Auth (Sajid Miya is a seeded user; OTP is always 123456)
 TOKEN=$(curl -s -X POST https://your-service.onrender.com/auth/verify-otp \
   -H 'Content-Type: application/json' \
-  -d '{"phone":"+15550000001","otp":"123456"}' \
+  -d '{"phone":"+919000000001","otp":"123456"}' \
   | python -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
 # 3. Conversations
@@ -114,7 +114,7 @@ curl -s https://your-service.onrender.com/conversations \
 # 4. WS smoke: open the app in two browser windows and send a message between users
 ```
 
-Open the deployed URL in two browser windows; log in as Alice in one and Bob in the other (OTP `123456`); send a message from Alice → should appear in Bob's window in under 1 s.
+Open the deployed URL in two browser windows; log in as Sajid Miya and Aasif Miya (OTP `123456`); send a message from Sajid → it should appear in Aasif's window in under 1 s.
 
 ## Database schema
 
@@ -258,7 +258,7 @@ The JWT payload: `{sub: user_id, phone, iat, exp, iss:"signal-clone"}`, HS256-si
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:8000/auth/verify-otp \
   -H 'Content-Type: application/json' \
-  -d '{"phone":"+15550000001","otp":"123456"}' \
+  -d '{"phone":"+919000000001","otp":"123456"}' \
   | python -c "import sys,json; print(json.load(sys.stdin)['token'])")
 H="Authorization: Bearer $TOKEN"
 

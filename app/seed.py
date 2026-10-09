@@ -6,11 +6,12 @@ existing rows by deterministic keys (phone, conversation shape, content)
 and skip work that's already done.
 
 Layout of the seeded DB:
-  - 7 users (Alice, Bob, Carol, Dan, Eve, Maya, Noah)
+  - 6 users (Sajid Miya, Aasif Miya, Ajmal Miya, Sajjan Karn,
+    Sakshyam Pokhrel, Raman Shrestha)
   - 6 groups and 6 direct chats (12 conversations total)
-  - 10 conversations visible to Alice
+  - 10 conversations visible to Sajid
   - 50+ messages, including multiple replies, image/file attachments, and reactions
-  - `message_status` rows for every (message, non-sender participant) —
+  - `message_status` rows for every message recipient —
     recent ones are 'read', older ones are 'delivered'.
 """
 
@@ -52,7 +53,13 @@ def _ago(days: float) -> datetime:
 
 
 def _get_or_create_user(
-    db: Session, phone: str, *, username: str | None = None, display_name: str, avatar_url: str
+    db: Session,
+    phone: str,
+    *,
+    username: str | None = None,
+    display_name: str,
+    avatar_url: str,
+    legacy_phone: str | None = None,
 ) -> User:
     """Find a user by phone, creating one with the given profile if absent.
 
@@ -61,14 +68,15 @@ def _get_or_create_user(
     idempotency.
     """
     user = db.query(User).filter(User.phone == phone).one_or_none()
+    if user is None and legacy_phone is not None:
+        # Upgrade an older persistent demo account in place so its chats,
+        # contacts, and message history remain attached to the new identity.
+        user = db.query(User).filter(User.phone == legacy_phone).one_or_none()
     if user is not None:
-        # Fill missing demo profile fields on older persistent databases.
-        if user.username is None and username is not None:
-            user.username = username
-        if user.display_name is None:
-            user.display_name = display_name
-        if user.avatar_url is None:
-            user.avatar_url = avatar_url
+        user.phone = phone
+        user.username = username
+        user.display_name = display_name
+        user.avatar_url = avatar_url
         return user
     user = User(
         phone=phone,
@@ -79,6 +87,60 @@ def _get_or_create_user(
     db.add(user)
     db.flush()
     return user
+
+
+def _retire_legacy_demo_user(
+    db: Session, phone: str, *, direct_replacement: User, group_replacement: User
+) -> None:
+    """Remove the former seventh demo account while preserving its sample chats."""
+    legacy = db.query(User).filter(User.phone == phone).one_or_none()
+    if legacy is None:
+        return
+
+    replacements: dict[int, int] = {}
+    memberships = (
+        db.query(ConversationParticipant)
+        .filter(ConversationParticipant.user_id == legacy.id)
+        .all()
+    )
+    for membership in memberships:
+        conversation = db.get(Conversation, membership.conversation_id)
+        if conversation is None:
+            continue
+        preferred = (
+            direct_replacement
+            if conversation.type == ConversationType.DIRECT
+            else group_replacement
+        )
+        member_ids = {
+            row.user_id
+            for row in db.query(ConversationParticipant)
+            .filter(ConversationParticipant.conversation_id == conversation.id)
+            .all()
+            if row.user_id != legacy.id
+        }
+        replacement = preferred
+        if replacement.id in member_ids:
+            db.delete(membership)
+        else:
+            membership.user_id = replacement.id
+        replacements[conversation.id] = replacement.id
+
+    db.flush()
+    for message in db.query(Message).filter(Message.sender_id == legacy.id).all():
+        message.sender_id = replacements.get(message.conversation_id, direct_replacement.id)
+
+    db.query(MessageStatus).filter(MessageStatus.user_id == legacy.id).delete(
+        synchronize_session=False
+    )
+    db.query(MessageReaction).filter(MessageReaction.user_id == legacy.id).delete(
+        synchronize_session=False
+    )
+    db.query(Contact).filter(
+        (Contact.owner_id == legacy.id) | (Contact.contact_id == legacy.id)
+    ).delete(synchronize_session=False)
+    db.delete(legacy)
+    db.flush()
 
 
 def _get_or_create_direct(db: Session, user_a_id: int, user_b_id: int) -> Conversation:
@@ -117,7 +179,9 @@ def _get_or_create_direct(db: Session, user_a_id: int, user_b_id: int) -> Conver
     return conv
 
 
-def _get_or_create_group(db: Session, name: str, user_ids: list[int]) -> Conversation:
+def _get_or_create_group(
+    db: Session, name: str, user_ids: list[int], *, legacy_name: str | None = None
+) -> Conversation:
     """Find or create a group conversation by name.
 
     Membership is re-synced on creation only — if a re-seed changes the
@@ -126,10 +190,14 @@ def _get_or_create_group(db: Session, name: str, user_ids: list[int]) -> Convers
     """
     conv = (
         db.query(Conversation)
-        .filter(Conversation.name == name, Conversation.type == ConversationType.GROUP)
+        .filter(
+            Conversation.name.in_([value for value in (name, legacy_name) if value]),
+            Conversation.type == ConversationType.GROUP,
+        )
         .one_or_none()
     )
     if conv is not None:
+        conv.name = name
         return conv
 
     conv = Conversation(type=ConversationType.GROUP, name=name)
@@ -214,6 +282,14 @@ def _find_seed_message(db: Session, conversation_id: int, content: str) -> Messa
     )
 
 
+def _rename_legacy_seed_message(
+    db: Session, conversation_id: int, old_content: str, new_content: str
+) -> None:
+    message = _find_seed_message(db, conversation_id, old_content)
+    if message is not None:
+        message.content = new_content
+
+
 def _ensure_seed_attachment(
     db: Session, *, message: Message | None, url: str, mime: str, size_bytes: int
 ) -> None:
@@ -295,88 +371,103 @@ def _statuses_for_message(
 
 def _seed(db: Session) -> None:
     # 1) Users --------------------------------------------------------------
-    alice = _get_or_create_user(
+    sajid = _get_or_create_user(
         db,
-        phone="+15550000001",
-        username="alicechen",
-        display_name="Alice Chen",
-        avatar_url="https://i.pravatar.cc/150?u=alice",
+        phone="+919000000001",
+        legacy_phone="+15550000001",
+        username="sajidmiya",
+        display_name="Sajid Miya",
+        avatar_url="https://i.pravatar.cc/150?u=sajid",
     )
-    bob = _get_or_create_user(
+    aasif = _get_or_create_user(
         db,
-        phone="+15550000002",
-        username="bobmartinez",
-        display_name="Bob Martinez",
-        avatar_url="https://i.pravatar.cc/150?u=bob",
+        phone="+919000000002",
+        legacy_phone="+15550000002",
+        username="aasifmiya",
+        display_name="Aasif Miya",
+        avatar_url="https://i.pravatar.cc/150?u=aasif",
     )
-    carol = _get_or_create_user(
+    ajmal = _get_or_create_user(
         db,
-        phone="+15550000003",
-        username="carolsingh",
-        display_name="Carol Singh",
-        avatar_url="https://i.pravatar.cc/150?u=carol",
+        phone="+919000000003",
+        legacy_phone="+15550000003",
+        username="ajmalmiya",
+        display_name="Ajmal Miya",
+        avatar_url="https://i.pravatar.cc/150?u=ajmal",
     )
-    dan = _get_or_create_user(
+    sajjan = _get_or_create_user(
         db,
-        phone="+15550000004",
-        username="danobrien",
-        display_name="Dan O'Brien",
-        avatar_url="https://i.pravatar.cc/150?u=dan",
+        phone="+919000000004",
+        legacy_phone="+15550000004",
+        username="sajjankarn",
+        display_name="Sajjan Karn",
+        avatar_url="https://i.pravatar.cc/150?u=sajjan",
     )
-    eve = _get_or_create_user(
+    sakshyam = _get_or_create_user(
         db,
-        phone="+15550000005",
-        username="evetanaka",
-        display_name="Eve Tanaka",
-        avatar_url="https://i.pravatar.cc/150?u=eve",
+        phone="+919000000005",
+        legacy_phone="+15550000005",
+        username="sakshyampokhrel",
+        display_name="Sakshyam Pokhrel",
+        avatar_url="https://i.pravatar.cc/150?u=sakshyam",
     )
-    maya = _get_or_create_user(
+    raman = _get_or_create_user(
         db,
-        phone="+15550000006",
-        username="mayabrooks",
-        display_name="Maya Brooks",
-        avatar_url="https://i.pravatar.cc/150?u=maya",
+        phone="+919000000006",
+        legacy_phone="+15550000006",
+        username="ramanshrestha",
+        display_name="Raman Shrestha",
+        avatar_url="https://i.pravatar.cc/150?u=raman",
     )
-    noah = _get_or_create_user(
+    _retire_legacy_demo_user(
         db,
-        phone="+15550000007",
-        username="noahwilliams",
-        display_name="Noah Williams",
-        avatar_url="https://i.pravatar.cc/150?u=noah",
+        "+15550000007",
+        direct_replacement=sajjan,
+        group_replacement=raman,
     )
-    users_by_id = {u.id: u for u in (alice, bob, carol, dan, eve, maya, noah)}
+    users_by_id = {u.id: u for u in (sajid, aasif, ajmal, sajjan, sakshyam, raman)}
 
     # 2) Conversations ------------------------------------------------------
-    # 6 groups + 6 direct chats = 12 total. Alice participates in 10
+    # 6 groups + 6 direct chats = 12 total. Sajid participates in 10
     # conversations so the demo inbox feels populated on first login.
     phoenix = _get_or_create_group(
-        db, "Project Phoenix", [alice.id, bob.id, carol.id]
+        db, "Campus Project", [sajid.id, aasif.id, ajmal.id], legacy_name="Project Phoenix"
     )
     family = _get_or_create_group(
-        db, "Family Group", [alice.id, bob.id, dan.id, eve.id]
+        db, "Miya Family", [sajid.id, aasif.id, sajjan.id, sakshyam.id], legacy_name="Family Group"
     )
     squad = _get_or_create_group(
-        db, "Squad Goals", [alice.id, carol.id, dan.id, eve.id]
+        db, "Weekend Games", [sajid.id, ajmal.id, sajjan.id, sakshyam.id], legacy_name="Squad Goals"
     )
     design = _get_or_create_group(
-        db, "Design Reviews", [alice.id, maya.id, bob.id, carol.id]
+        db, "Design Reviews", [sajid.id, raman.id, aasif.id, ajmal.id]
     )
     weekend = _get_or_create_group(
-        db, "Weekend Plans", [alice.id, noah.id, dan.id, eve.id]
+        db, "Weekend Plans", [sajid.id, raman.id, sajjan.id, sakshyam.id]
     )
     launch = _get_or_create_group(
-        db, "Product Launch", [alice.id, bob.id, carol.id, dan.id, eve.id]
+        db, "Launch Crew", [sajid.id, aasif.id, ajmal.id, sajjan.id, sakshyam.id], legacy_name="Product Launch"
     )
 
-    d_ab = _get_or_create_direct(db, alice.id, bob.id)
-    d_ac = _get_or_create_direct(db, alice.id, carol.id)
-    d_bd = _get_or_create_direct(db, bob.id, dan.id)
-    d_ce = _get_or_create_direct(db, carol.id, eve.id)
-    d_am = _get_or_create_direct(db, alice.id, maya.id)
-    d_an = _get_or_create_direct(db, alice.id, noah.id)
+    d_ab = _get_or_create_direct(db, sajid.id, aasif.id)
+    d_ac = _get_or_create_direct(db, sajid.id, ajmal.id)
+    d_bd = _get_or_create_direct(db, aasif.id, sajjan.id)
+    d_ce = _get_or_create_direct(db, ajmal.id, sakshyam.id)
+    d_am = _get_or_create_direct(db, sajid.id, raman.id)
+    d_an = _get_or_create_direct(db, sajid.id, sajjan.id)
+
+    # Bring names in the already-persisted sample transcripts along with the
+    # account/profile migration. These exact strings are from the old seed.
+    for conversation_id, old_content, new_content in (
+        (d_ab.id, "Hey Bob, you free for coffee tomorrow?", "Hey Aasif, free to grab chai tomorrow?"),
+        (d_ac.id, "Alice, did you finish the API contract?", "Sajid, did you finish the API contract?"),
+        (d_bd.id, "Dan, the deploy looks good", "Sajjan, the deploy looks good"),
+        (d_ce.id, "Eve, are we still on for the hike Saturday?", "Sakshyam, are we still on for the hike Saturday?"),
+    ):
+        _rename_legacy_seed_message(db, conversation_id, old_content, new_content)
 
     # 2b) Contacts --------------------------------------------------------
-    # Add a few contacts for Alice and cross-address-book rows so
+    # Add a few contacts for Sajid and cross-address-book rows so
     # contact lookup includes both saved and unsaved seeded users.
     def _add_contact(owner: User, target: User) -> None:
         existing = (
@@ -389,15 +480,14 @@ def _seed(db: Session) -> None:
         db.add(Contact(owner_id=owner.id, contact_id=target.id))
         db.flush()
 
-    _add_contact(alice, carol)
-    _add_contact(alice, dan)
-    _add_contact(alice, maya)
-    _add_contact(alice, noah)
-    _add_contact(bob, alice)
-    _add_contact(dan, alice)
+    _add_contact(sajid, ajmal)
+    _add_contact(sajid, sajjan)
+    _add_contact(sajid, raman)
+    _add_contact(aasif, sajid)
+    _add_contact(sajjan, sajid)
 
     # 3) Messages -----------------------------------------------------------
-    # Each seeded conversation gets a compact timeline; Alice sees ten
+    # Each seeded conversation gets a compact timeline; Sajid sees ten
     # populated conversations after signing in.
 
     def _emit(conv_id: int, sender: User, content: str, days_ago: float, **kw):
@@ -412,62 +502,62 @@ def _seed(db: Session) -> None:
         return m
 
     if not _conversation_has_messages(db, d_ab.id):
-        _emit(d_ab.id, alice, "Hey Bob, you free for coffee tomorrow?", 6.5)
-        _emit(d_ab.id, bob, "Sure, 10am at the usual place?", 6.3)
-        _emit(d_ab.id, alice, "Works for me. See you then!", 6.1)
-        _emit(d_ab.id, bob, "I just pushed the design review notes.", 2.0)
-        _emit(d_ab.id, alice, "Got them, will read tonight.", 1.5)
+        _emit(d_ab.id, sajid, "Hey Aasif, you free for coffee tomorrow?", 6.5)
+        _emit(d_ab.id, aasif, "Sure, 10am at the usual place?", 6.3)
+        _emit(d_ab.id, sajid, "Works for me. See you then!", 6.1)
+        _emit(d_ab.id, aasif, "I just pushed the design review notes.", 2.0)
+        _emit(d_ab.id, sajid, "Got them, will read tonight.", 1.5)
 
     if not _conversation_has_messages(db, d_ac.id):
-        _emit(d_ac.id, carol, "Alice, did you finish the API contract?", 5.5)
-        _emit(d_ac.id, alice, "Almost — adding the last 2 endpoints today.", 5.3)
-        _emit(d_ac.id, carol, "Sweet. Let me know when it's up.", 5.0)
-        _emit(d_ac.id, alice, "Done. Documented in /docs/api.md", 2.5)
-        _emit(d_ac.id, carol, "Perfect, thanks!", 2.3)
+        _emit(d_ac.id, ajmal, "Sajid, did you finish the API contract?", 5.5)
+        _emit(d_ac.id, sajid, "Almost — adding the last 2 endpoints today.", 5.3)
+        _emit(d_ac.id, ajmal, "Sweet. Let me know when it's up.", 5.0)
+        _emit(d_ac.id, sajid, "Done. Documented in /docs/api.md", 2.5)
+        _emit(d_ac.id, ajmal, "Perfect, thanks!", 2.3)
 
     if not _conversation_has_messages(db, d_bd.id):
-        _emit(d_bd.id, bob, "Dan, the deploy looks good", 4.0)
-        _emit(d_bd.id, dan, "Thanks for the heads up", 3.9)
-        _emit(d_bd.id, bob, "Anytime. How's the family?", 3.5)
-        _emit(d_bd.id, dan, "All good. Kids started school this week.", 3.4)
-        _emit(d_bd.id, bob, "Time flies. Tell them I said hi.", 1.0)
+        _emit(d_bd.id, aasif, "Sajjan, the deploy looks good", 4.0)
+        _emit(d_bd.id, sajjan, "Thanks for the heads up", 3.9)
+        _emit(d_bd.id, aasif, "Anytime. How's the family?", 3.5)
+        _emit(d_bd.id, sajjan, "All good. Kids started school this week.", 3.4)
+        _emit(d_bd.id, aasif, "Time flies. Tell them I said hi.", 1.0)
 
     if not _conversation_has_messages(db, d_ce.id):
-        _emit(d_ce.id, carol, "Eve, are we still on for the hike Saturday?", 4.5)
-        _emit(d_ce.id, eve, "Yes! Bringing the good snacks.", 4.4)
-        _emit(d_ce.id, carol, "Trail head at 8am?", 4.3)
-        _emit(d_ce.id, eve, "Sounds good 👍", 4.2)
-        _emit(d_ce.id, carol, "See you there!", 0.5)
+        _emit(d_ce.id, ajmal, "Sakshyam, are we still on for the hike Saturday?", 4.5)
+        _emit(d_ce.id, sakshyam, "Yes! Bringing the good snacks.", 4.4)
+        _emit(d_ce.id, ajmal, "Trail head at 8am?", 4.3)
+        _emit(d_ce.id, sakshyam, "Sounds good 👍", 4.2)
+        _emit(d_ce.id, ajmal, "See you there!", 0.5)
 
     if not _conversation_has_messages(db, phoenix.id):
-        first = _emit(phoenix.id, alice, "Standup in 10, who's joining?", 6.0)
-        _emit(phoenix.id, bob, "I'll be there.", 5.95)
-        # Reply to Alice's standup message
+        first = _emit(phoenix.id, sajid, "Standup in 10, who's joining?", 6.0)
+        _emit(phoenix.id, aasif, "I'll be there.", 5.95)
+        # Reply to Sajid's standup message
         _emit(
             phoenix.id,
-            carol,
+            ajmal,
             "Joining in 5, saving my update for last.",
             5.9,
             parent_id=first.id,
         )
-        _emit(phoenix.id, alice, "Updated the tracker with this week's tasks.", 3.0)
-        _emit(phoenix.id, bob, "I'll handle the migration script.", 2.8)
+        _emit(phoenix.id, sajid, "Updated the tracker with this week's tasks.", 3.0)
+        _emit(phoenix.id, aasif, "I'll handle the migration script.", 2.8)
 
     if not _conversation_has_messages(db, family.id):
-        _emit(family.id, dan, "Sunday dinner at my place, 6pm.", 3.5)
-        _emit(family.id, eve, "I'll bring dessert.", 3.4)
-        _emit(family.id, alice, "Can I bring anything?", 3.3)
-        _emit(family.id, dan, "Just yourselves!", 3.25)
-        _emit(family.id, bob, "Can't make it this week, sorry.", 0.8)
+        _emit(family.id, sajjan, "Sunday dinner at my place, 6pm.", 3.5)
+        _emit(family.id, sakshyam, "I'll bring dessert.", 3.4)
+        _emit(family.id, sajid, "Can I bring anything?", 3.3)
+        _emit(family.id, sajjan, "Just yourselves!", 3.25)
+        _emit(family.id, aasif, "Can't make it this week, sorry.", 0.8)
 
     if not _conversation_has_messages(db, squad.id):
-        _emit(squad.id, carol, "Game night Friday?", 2.5)
-        _emit(squad.id, dan, "I'm in.", 2.4)
-        _emit(squad.id, eve, "Same. What are we playing?", 2.3)
+        _emit(squad.id, ajmal, "Game night Friday?", 2.5)
+        _emit(squad.id, sajjan, "I'm in.", 2.4)
+        _emit(squad.id, sakshyam, "Same. What are we playing?", 2.3)
         # Image-type message with attachment
         img = _emit(
             squad.id,
-            dan,
+            sajjan,
             "https://picsum.photos/seed/squad/600/400",
             2.0,
             type=MessageType.IMAGE,
@@ -480,48 +570,48 @@ def _seed(db: Session) -> None:
                 size_bytes=102400,
             )
         )
-        _emit(squad.id, carol, "That map looks wild, count me in.", 1.8)
+        _emit(squad.id, ajmal, "That map looks wild, count me in.", 1.8)
 
     if not _conversation_has_messages(db, d_am.id):
-        _emit(d_am.id, alice, "Can you review the poster direction?", 2.2)
-        _emit(d_am.id, maya, "The blue version feels clearer.", 2.1)
-        _emit(d_am.id, alice, "Agreed. Here's the updated mockup.", 2.0)
-        _emit(d_am.id, maya, "Much better — the title has room now.", 1.9)
-        _emit(d_am.id, alice, "Great, I'll send this to the team.", 1.8)
+        _emit(d_am.id, sajid, "Can you review the poster direction?", 2.2)
+        _emit(d_am.id, raman, "The blue version feels clearer.", 2.1)
+        _emit(d_am.id, sajid, "Agreed. Here's the updated mockup.", 2.0)
+        _emit(d_am.id, raman, "Much better — the title has room now.", 1.9)
+        _emit(d_am.id, sajid, "Great, I'll send this to the team.", 1.8)
 
     if not _conversation_has_messages(db, d_an.id):
-        parent = _emit(d_an.id, alice, "Could you review the launch brief?", 2.0)
-        _emit(d_an.id, noah, "Sure, I can look now.", 1.9)
-        _emit(d_an.id, alice, "I attached the latest draft.", 1.8)
+        parent = _emit(d_an.id, sajid, "Could you review the launch brief?", 2.0)
+        _emit(d_an.id, sajjan, "Sure, I can look now.", 1.9)
+        _emit(d_an.id, sajid, "I attached the latest draft.", 1.8)
         _emit(
             d_an.id,
-            noah,
+            sajjan,
             "The timeline looks solid. I left one note on the first section.",
             1.7,
             parent_id=parent.id,
         )
-        _emit(d_an.id, alice, "Thanks — I'll update it before stand-up.", 1.6)
+        _emit(d_an.id, sajid, "Thanks — I'll update it before stand-up.", 1.6)
 
     if not _conversation_has_messages(db, design.id):
-        _emit(design.id, alice, "I put the new screens in the review folder.", 1.6)
-        _emit(design.id, bob, "The new navigation is much easier to scan.", 1.5)
-        _emit(design.id, maya, "Adding the annotated brief here, too.", 1.4)
-        _emit(design.id, carol, "The spacing feels good on mobile.", 1.3)
-        _emit(design.id, alice, "Nice — let's use this version.", 1.2)
+        _emit(design.id, sajid, "I put the new screens in the review folder.", 1.6)
+        _emit(design.id, aasif, "The new navigation is much easier to scan.", 1.5)
+        _emit(design.id, raman, "Adding the annotated brief here, too.", 1.4)
+        _emit(design.id, ajmal, "The spacing feels good on mobile.", 1.3)
+        _emit(design.id, sajid, "Nice — let's use this version.", 1.2)
 
     if not _conversation_has_messages(db, weekend.id):
-        _emit(weekend.id, dan, "Saturday trail plan: meet at 8?", 1.4)
-        _emit(weekend.id, eve, "Yes, I'll bring snacks.", 1.3)
-        _emit(weekend.id, noah, "Sharing the route photo.", 1.2)
-        _emit(weekend.id, alice, "That view is worth the early start.", 1.1)
-        _emit(weekend.id, dan, "Parking lot by the north entrance.", 1.0)
+        _emit(weekend.id, sajjan, "Saturday trail plan: meet at 8?", 1.4)
+        _emit(weekend.id, sakshyam, "Yes, I'll bring snacks.", 1.3)
+        _emit(weekend.id, sajjan, "Sharing the route photo.", 1.2)
+        _emit(weekend.id, sajid, "That view is worth the early start.", 1.1)
+        _emit(weekend.id, sajjan, "Parking lot by the north entrance.", 1.0)
 
     if not _conversation_has_messages(db, launch.id):
-        _emit(launch.id, bob, "Milestone two is ready for review.", 1.1)
-        _emit(launch.id, carol, "The test build is looking good.", 1.0)
-        _emit(launch.id, alice, "I attached the checklist for tomorrow.", 0.9)
-        _emit(launch.id, dan, "I can take the first two items.", 0.8)
-        _emit(launch.id, eve, "I'll cover the release notes.", 0.7)
+        _emit(launch.id, aasif, "Milestone two is ready for review.", 1.1)
+        _emit(launch.id, ajmal, "The test build is looking good.", 1.0)
+        _emit(launch.id, sajid, "I attached the checklist for tomorrow.", 0.9)
+        _emit(launch.id, sajjan, "I can take the first two items.", 0.8)
+        _emit(launch.id, sakshyam, "I'll cover the release notes.", 0.7)
 
     # Rich sample content is ensured separately so existing persistent
     # databases receive new examples on the next deployment as well.
@@ -575,31 +665,31 @@ def _seed(db: Session) -> None:
     _ensure_seed_reaction(
         db,
         message=_find_seed_message(db, phoenix.id, "Standup in 10, who's joining?"),
-        user=bob,
+        user=aasif,
         emoji="👍",
     )
     _ensure_seed_reaction(
         db,
         message=_find_seed_message(db, d_am.id, "The blue version feels clearer."),
-        user=alice,
+        user=sajid,
         emoji="💙",
     )
     _ensure_seed_reaction(
         db,
         message=_find_seed_message(db, design.id, "The new navigation is much easier to scan."),
-        user=maya,
+        user=raman,
         emoji="✨",
     )
     _ensure_seed_reaction(
         db,
         message=_find_seed_message(db, weekend.id, "That view is worth the early start."),
-        user=eve,
+        user=sakshyam,
         emoji="❤️",
     )
     _ensure_seed_reaction(
         db,
         message=_find_seed_message(db, launch.id, "Milestone two is ready for review."),
-        user=alice,
+        user=sajid,
         emoji="🚀",
     )
 
