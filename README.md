@@ -64,7 +64,7 @@ On startup the app calls `Base.metadata.create_all` (idempotent) and runs a `[st
 
 ```bash
 curl http://localhost:8000/health
-# -> {"status":"ok","db":"reachable","counts":{"users":5,"contacts":2,"conversations":7,...}}
+# -> {"status":"ok","db":"reachable","counts":{"users":7,"contacts":6,"conversations":12,...}}
 
 sqlite3 app.db "PRAGMA journal_mode;"
 # -> wal

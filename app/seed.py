@@ -6,14 +6,10 @@ existing rows by deterministic keys (phone, conversation shape, content)
 and skip work that's already done.
 
 Layout of the seeded DB:
-  - 5 users (Alice, Bob, Carol, Dan, Eve)
-  - 3 groups (Project Phoenix 3, Family Group 4, Squad Goals 3)
-  - 4 direct conversations (one per representative pair)
-  - 7 conversations total
-  - 30+ messages spread over the last 7 days, including:
-      * 1 reply (parent_id set)
-      * 1 image-type message with a corresponding `attachments` row
-      * 1 reaction on an existing message
+  - 7 users (Alice, Bob, Carol, Dan, Eve, Maya, Noah)
+  - 6 groups and 6 direct chats (12 conversations total)
+  - 10 conversations visible to Alice
+  - 50+ messages, including multiple replies, image/file attachments, and reactions
   - `message_status` rows for every (message, non-sender participant) —
     recent ones are 'read', older ones are 'delivered'.
 """
@@ -66,6 +62,13 @@ def _get_or_create_user(
     """
     user = db.query(User).filter(User.phone == phone).one_or_none()
     if user is not None:
+        # Fill missing demo profile fields on older persistent databases.
+        if user.username is None and username is not None:
+            user.username = username
+        if user.display_name is None:
+            user.display_name = display_name
+        if user.avatar_url is None:
+            user.avatar_url = avatar_url
         return user
     user = User(
         phone=phone,
@@ -202,6 +205,54 @@ def _add_message(
     return msg
 
 
+def _find_seed_message(db: Session, conversation_id: int, content: str) -> Message | None:
+    return (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id, Message.content == content)
+        .order_by(Message.id)
+        .first()
+    )
+
+
+def _ensure_seed_attachment(
+    db: Session, *, message: Message | None, url: str, mime: str, size_bytes: int
+) -> None:
+    if message is None:
+        return
+    exists = (
+        db.query(Attachment)
+        .filter(Attachment.message_id == message.id, Attachment.url == url)
+        .one_or_none()
+    )
+    if exists is None:
+        db.add(
+            Attachment(
+                message_id=message.id,
+                url=url,
+                mime=mime,
+                size_bytes=size_bytes,
+            )
+        )
+
+
+def _ensure_seed_reaction(
+    db: Session, *, message: Message | None, user: User, emoji: str
+) -> None:
+    if message is None:
+        return
+    exists = (
+        db.query(MessageReaction)
+        .filter(
+            MessageReaction.message_id == message.id,
+            MessageReaction.user_id == user.id,
+            MessageReaction.emoji == emoji,
+        )
+        .one_or_none()
+    )
+    if exists is None:
+        db.add(MessageReaction(message_id=message.id, user_id=user.id, emoji=emoji))
+
+
 def _add_status(
     db: Session, *, message_id: int, user_id: int, state: MessageStatusState
 ) -> None:
@@ -254,33 +305,50 @@ def _seed(db: Session) -> None:
     bob = _get_or_create_user(
         db,
         phone="+15550000002",
+        username="bobmartinez",
         display_name="Bob Martinez",
         avatar_url="https://i.pravatar.cc/150?u=bob",
     )
     carol = _get_or_create_user(
         db,
         phone="+15550000003",
+        username="carolsingh",
         display_name="Carol Singh",
         avatar_url="https://i.pravatar.cc/150?u=carol",
     )
     dan = _get_or_create_user(
         db,
         phone="+15550000004",
+        username="danobrien",
         display_name="Dan O'Brien",
         avatar_url="https://i.pravatar.cc/150?u=dan",
     )
     eve = _get_or_create_user(
         db,
         phone="+15550000005",
+        username="evetanaka",
         display_name="Eve Tanaka",
         avatar_url="https://i.pravatar.cc/150?u=eve",
     )
-    users_by_id = {u.id: u for u in (alice, bob, carol, dan, eve)}
+    maya = _get_or_create_user(
+        db,
+        phone="+15550000006",
+        username="mayabrooks",
+        display_name="Maya Brooks",
+        avatar_url="https://i.pravatar.cc/150?u=maya",
+    )
+    noah = _get_or_create_user(
+        db,
+        phone="+15550000007",
+        username="noahwilliams",
+        display_name="Noah Williams",
+        avatar_url="https://i.pravatar.cc/150?u=noah",
+    )
+    users_by_id = {u.id: u for u in (alice, bob, carol, dan, eve, maya, noah)}
 
     # 2) Conversations ------------------------------------------------------
-    # 3 groups, 4 direct = 7 conversations total. Alice is added to the
-    # Squad group too (spec: she should be a participant in enough
-    # conversations that `GET /conversations` returns ≥5 for her).
+    # 6 groups + 6 direct chats = 12 total. Alice participates in 10
+    # conversations so the demo inbox feels populated on first login.
     phoenix = _get_or_create_group(
         db, "Project Phoenix", [alice.id, bob.id, carol.id]
     )
@@ -290,20 +358,26 @@ def _seed(db: Session) -> None:
     squad = _get_or_create_group(
         db, "Squad Goals", [alice.id, carol.id, dan.id, eve.id]
     )
+    design = _get_or_create_group(
+        db, "Design Reviews", [alice.id, maya.id, bob.id, carol.id]
+    )
+    weekend = _get_or_create_group(
+        db, "Weekend Plans", [alice.id, noah.id, dan.id, eve.id]
+    )
+    launch = _get_or_create_group(
+        db, "Product Launch", [alice.id, bob.id, carol.id, dan.id, eve.id]
+    )
 
     d_ab = _get_or_create_direct(db, alice.id, bob.id)
     d_ac = _get_or_create_direct(db, alice.id, carol.id)
     d_bd = _get_or_create_direct(db, bob.id, dan.id)
     d_ce = _get_or_create_direct(db, carol.id, eve.id)
+    d_am = _get_or_create_direct(db, alice.id, maya.id)
+    d_an = _get_or_create_direct(db, alice.id, noah.id)
 
     # 2b) Contacts --------------------------------------------------------
-    # Phase 4 needs ≥2 contacts for Alice so `GET /contacts` returns
-    # data on a fresh DB. We also add a couple of cross-address-book
-    # rows so the search endpoint can show a mix of `already_contact`
-    # true/false. Notably, Alice does NOT have Bob as a contact yet —
-    # the conversations smoke test asserts that POST /contacts for Bob
-    # succeeds (i.e. creates a new contact row), so we leave that slot
-    # empty.
+    # Add a few contacts for Alice and cross-address-book rows so
+    # contact lookup includes both saved and unsaved seeded users.
     def _add_contact(owner: User, target: User) -> None:
         existing = (
             db.query(Contact)
@@ -317,15 +391,14 @@ def _seed(db: Session) -> None:
 
     _add_contact(alice, carol)
     _add_contact(alice, dan)
+    _add_contact(alice, maya)
+    _add_contact(alice, noah)
     _add_contact(bob, alice)
     _add_contact(dan, alice)
 
     # 3) Messages -----------------------------------------------------------
-    # Direct conversations: 5 messages each, spread over 7 days.
-    # Groups: 5 messages each.
-    # We pick 1 reply in Phoenix, 1 image in Squad, 1 reaction in Phoenix.
-
-    all_messages: list[Message] = []
+    # Each seeded conversation gets a compact timeline; Alice sees ten
+    # populated conversations after signing in.
 
     def _emit(conv_id: int, sender: User, content: str, days_ago: float, **kw):
         m = _add_message(
@@ -336,7 +409,6 @@ def _seed(db: Session) -> None:
             created_at=_ago(days_ago),
             **kw,
         )
-        all_messages.append(m)
         return m
 
     if not _conversation_has_messages(db, d_ab.id):
@@ -410,17 +482,126 @@ def _seed(db: Session) -> None:
         )
         _emit(squad.id, carol, "That map looks wild, count me in.", 1.8)
 
-    # 4) Reaction (idempotent: check before insert) -----------------------
-    if db.query(MessageReaction).count() == 0 and all_messages:
-        # React to the very first message we created with a thumbs up
-        first = all_messages[0]
-        db.add(
-            MessageReaction(
-                message_id=first.id,
-                user_id=carol.id,
-                emoji="👍",
-            )
+    if not _conversation_has_messages(db, d_am.id):
+        _emit(d_am.id, alice, "Can you review the poster direction?", 2.2)
+        _emit(d_am.id, maya, "The blue version feels clearer.", 2.1)
+        _emit(d_am.id, alice, "Agreed. Here's the updated mockup.", 2.0)
+        _emit(d_am.id, maya, "Much better — the title has room now.", 1.9)
+        _emit(d_am.id, alice, "Great, I'll send this to the team.", 1.8)
+
+    if not _conversation_has_messages(db, d_an.id):
+        parent = _emit(d_an.id, alice, "Could you review the launch brief?", 2.0)
+        _emit(d_an.id, noah, "Sure, I can look now.", 1.9)
+        _emit(d_an.id, alice, "I attached the latest draft.", 1.8)
+        _emit(
+            d_an.id,
+            noah,
+            "The timeline looks solid. I left one note on the first section.",
+            1.7,
+            parent_id=parent.id,
         )
+        _emit(d_an.id, alice, "Thanks — I'll update it before stand-up.", 1.6)
+
+    if not _conversation_has_messages(db, design.id):
+        _emit(design.id, alice, "I put the new screens in the review folder.", 1.6)
+        _emit(design.id, bob, "The new navigation is much easier to scan.", 1.5)
+        _emit(design.id, maya, "Adding the annotated brief here, too.", 1.4)
+        _emit(design.id, carol, "The spacing feels good on mobile.", 1.3)
+        _emit(design.id, alice, "Nice — let's use this version.", 1.2)
+
+    if not _conversation_has_messages(db, weekend.id):
+        _emit(weekend.id, dan, "Saturday trail plan: meet at 8?", 1.4)
+        _emit(weekend.id, eve, "Yes, I'll bring snacks.", 1.3)
+        _emit(weekend.id, noah, "Sharing the route photo.", 1.2)
+        _emit(weekend.id, alice, "That view is worth the early start.", 1.1)
+        _emit(weekend.id, dan, "Parking lot by the north entrance.", 1.0)
+
+    if not _conversation_has_messages(db, launch.id):
+        _emit(launch.id, bob, "Milestone two is ready for review.", 1.1)
+        _emit(launch.id, carol, "The test build is looking good.", 1.0)
+        _emit(launch.id, alice, "I attached the checklist for tomorrow.", 0.9)
+        _emit(launch.id, dan, "I can take the first two items.", 0.8)
+        _emit(launch.id, eve, "I'll cover the release notes.", 0.7)
+
+    # Rich sample content is ensured separately so existing persistent
+    # databases receive new examples on the next deployment as well.
+    mockup_message = _find_seed_message(
+        db, d_am.id, "Agreed. Here's the updated mockup."
+    )
+    _ensure_seed_attachment(
+        db,
+        message=mockup_message,
+        url="https://picsum.photos/seed/signal-mockup/720/480",
+        mime="image/jpeg",
+        size_bytes=184320,
+    )
+    _ensure_seed_attachment(
+        db,
+        message=mockup_message,
+        url="https://picsum.photos/seed/signal-layout/720/480",
+        mime="image/jpeg",
+        size_bytes=163840,
+    )
+    _ensure_seed_attachment(
+        db,
+        message=_find_seed_message(db, d_an.id, "I attached the latest draft."),
+        url="https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+        mime="application/pdf",
+        size_bytes=13264,
+    )
+    _ensure_seed_attachment(
+        db,
+        message=_find_seed_message(db, design.id, "Adding the annotated brief here, too."),
+        url="https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+        mime="application/pdf",
+        size_bytes=13264,
+    )
+    _ensure_seed_attachment(
+        db,
+        message=_find_seed_message(db, weekend.id, "Sharing the route photo."),
+        url="https://picsum.photos/seed/weekend-trail/720/480",
+        mime="image/jpeg",
+        size_bytes=172032,
+    )
+    _ensure_seed_attachment(
+        db,
+        message=_find_seed_message(db, launch.id, "I attached the checklist for tomorrow."),
+        url="https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+        mime="application/pdf",
+        size_bytes=13264,
+    )
+
+    # 4) Reactions (idempotent: ensure each sample reaction once) ---------
+    _ensure_seed_reaction(
+        db,
+        message=_find_seed_message(db, phoenix.id, "Standup in 10, who's joining?"),
+        user=bob,
+        emoji="👍",
+    )
+    _ensure_seed_reaction(
+        db,
+        message=_find_seed_message(db, d_am.id, "The blue version feels clearer."),
+        user=alice,
+        emoji="💙",
+    )
+    _ensure_seed_reaction(
+        db,
+        message=_find_seed_message(db, design.id, "The new navigation is much easier to scan."),
+        user=maya,
+        emoji="✨",
+    )
+    _ensure_seed_reaction(
+        db,
+        message=_find_seed_message(db, weekend.id, "That view is worth the early start."),
+        user=eve,
+        emoji="❤️",
+    )
+    _ensure_seed_reaction(
+        db,
+        message=_find_seed_message(db, launch.id, "Milestone two is ready for review."),
+        user=alice,
+        emoji="🚀",
+    )
 
     db.flush()
 
@@ -471,18 +652,15 @@ def _seed(db: Session) -> None:
 # --- Entry points ---------------------------------------------------------
 
 def run() -> None:
-    """Public entry point used by `python -m app.seed` and by tests."""
-    # Ensure tables exist before we try to query them. Idempotent.
+    """Ensure demo records exist, including additions to an older database."""
+    # Keep startup seeding idempotent while allowing a later deploy to add
+    # new sample conversations to an already-populated persistent database.
     Base.metadata.create_all(bind=engine)
 
     db = SessionLocal()
     try:
-        sentinel = db.query(User).filter(User.phone == "+15550000001").one_or_none()
-        if sentinel is not None:
-            print("[seed] DB already seeded; nothing to do.")
-            return
         _seed(db)
-        print("[seed] Seeded successfully.")
+        print("[seed] Demo data ensured.")
     finally:
         db.close()
 
