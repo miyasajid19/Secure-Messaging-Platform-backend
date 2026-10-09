@@ -251,6 +251,14 @@ _TABLES_FOR_HEALTH: tuple[str, ...] = (
     "message_reactions",
 )
 
+@app.head("/")
+def root_head() -> None:
+    """HEAD endpoint for sanity checking the process is up.
+
+    Returns 200 with no body. Does not check DB reachability.
+    """
+    return {"status": "ok","message": "The server is running.","hint":"this is added for keeping server alive on render.com via uptime robot."}
+
 @app.get("/")
 def root() -> dict:
     """Root endpoint for sanity checking the process is up.
