@@ -15,7 +15,7 @@ The frontend lives at `../frontend/` (Next.js 16 App Router, Vercel-deployed). T
                                                                   │
                                                           ┌───────▼────────┐
                                                           │ SQLite + WAL    │
-                                                          │ (Railway Vol.   │
+                                                          │ (Render Disk    │
                                                           │  /data/app.db)  │
                                                           └────────────────┘
 ```
@@ -31,11 +31,11 @@ Three layers:
 |---|---|---|
 | Framework | FastAPI 0.115+ | Async; built-in WebSocket support |
 | ORM | SQLAlchemy 2.x | Typed declarative (`Mapped[...]`, `mapped_column`) |
-| DB | SQLite 3 (WAL mode) | Single file on a Railway Volume mounted at `/data` |
+| DB | SQLite 3 (WAL mode) | Single file on a Render disk mounted at `/data` |
 | Auth | PyJWT (HS256) | Stateless; expiry 7 days |
 | Realtime | FastAPI WebSocket + asyncio | In-memory pub/sub by conversation |
 | Python | 3.11+ | `.python-version` pinned |
-| Deploy | Railway | Single replica and worker; persistent Volume at `/data` |
+| Deploy | Render | Single instance and worker; persistent disk at `/data` |
 
 ## Quick start (local dev)
 
@@ -70,17 +70,17 @@ sqlite3 app.db "PRAGMA journal_mode;"
 # -> wal
 ```
 
-## Deployment (Railway)
+## Deployment (Render)
 
-Railway detects the repository-root `Dockerfile` and builds the service from it. Create a Railway project, deploy this GitHub repository as a service, and configure it as follows:
+Create a Render **Web Service** from this GitHub repository and select the Docker runtime. Render builds the root `Dockerfile` and runs its `CMD` by default. Leave Render's Docker Command blank so the seed step is preserved.
 
-1. Attach a persistent Volume to the backend service with mount path `/data`. The database URL below points to `/data/app.db`; without the Volume, database data is lost when the container is replaced. Railway mounts volumes as root, so set the service variable `RAILWAY_RUN_UID=0` to let the container write to the mounted directory.
-2. Keep the service to **one replica** and one Uvicorn worker. The connection manager and disappearing-message sweeper keep state in process memory.
-3. Set the production environment variables in Railway's service Variables tab. Do not copy the local `.env` file or use the development JWT secret.
-4. Set the service healthcheck path to `/health` and generate a public domain under Networking. Railway supplies `PORT`; the Dockerfile listens on it.
-5. Deploy and check the service logs, then open `https://<your-domain>/health` to confirm the database is reachable.
+1. Attach a persistent disk with mount path `/data` (available on paid web services). Set `DATABASE_URL=sqlite:////data/app.db`. Without a disk, the database file is ephemeral and will be reseeded from scratch after a restart or deploy. A disk-backed service runs one instance and has a brief interruption during deploys.
+2. Keep one service instance and one Uvicorn worker. The connection manager and disappearing-message sweeper keep state in process memory. Render disks are limited to one service instance.
+3. Add the production environment variables in the Render service's Environment tab. Do not copy the local `.env` file or use the development JWT secret.
+4. Set the health check path to `/health`. The Dockerfile binds to `0.0.0.0` and defaults to Render's `PORT` value of `10000`.
+5. Enable auto-deploy for the connected Git branch if you want each push to redeploy. After pushing, check the deploy logs and open `https://<your-service>.onrender.com/health` to confirm the database is reachable.
 
-The Docker start command runs `python -m app.seed` before Uvicorn. The seed script checks for its demo-user sentinel and does nothing when the database is already seeded, so restarts and redeploys do not duplicate the demo data. The `/data` Volume must be attached for this seed data to persist.
+The Docker start command runs `python -m app.seed` before Uvicorn on every container start. The seed script checks for its demo-user sentinel and does nothing when the database is already seeded, so restarts and redeploys do not duplicate the demo data. Render pre-deploy commands run on a separate instance without the persistent disk, so the startup command is used for seeding.
 
 ### Env vars (production)
 
@@ -98,20 +98,20 @@ The Docker start command runs `python -m app.seed` before Uvicorn. The seed scri
 
 ```bash
 # 1. Health
-curl https://your-app.up.railway.app/health
+curl https://your-service.onrender.com/health
 # -> {"status":"ok","db":"reachable","counts":{...}}
 
 # 2. Auth (Alice is a seeded user; OTP is always 123456)
-TOKEN=$(curl -s -X POST https://your-app.up.railway.app/auth/verify-otp \
+TOKEN=$(curl -s -X POST https://your-service.onrender.com/auth/verify-otp \
   -H 'Content-Type: application/json' \
   -d '{"phone":"+15550000001","otp":"123456"}' \
   | python -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
 # 3. Conversations
-curl -s https://your-app.up.railway.app/conversations \
+curl -s https://your-service.onrender.com/conversations \
   -H "Authorization: Bearer $TOKEN"
 
-# 4. WS smoke (see tests/test_realtime.py for the full Python client)
+# 4. WS smoke: open the app in two browser windows and send a message between users
 ```
 
 Open the deployed URL in two browser windows; log in as Alice in one and Bob in the other (OTP `123456`); send a message from Alice → should appear in Bob's window in under 1 s.
@@ -328,24 +328,6 @@ All four broadcast `message.new` (with a system message documenting the change) 
 
 Set `IMAGEKIT_PRIVATE_KEY` in the backend `.env` to enable the paperclip in the composer. The upload endpoint is `POST /auth/upload-image`. Files go through the authenticated backend; the private key is never sent to the browser. Images appear inline in the chat; other file types become downloadable attachment rows.
 
-## Tests
-
-`tests/test_*.py` are scripted end-to-end smoke tests using FastAPI's `TestClient` and direct DB / WS clients. They run in-process against whatever the test sets up; no separate uvicorn required.
-
-```bash
-.venv/bin/python tests/test_auth.py            # 18+ assertions: mocked OTP, JWT, /me, /profile, /logout
-.venv/bin/python tests/test_conversations.py   # 60+ assertions: list, messages, contacts, search, dedupe
-.venv/bin/python tests/test_realtime.py        # 18+ assertions: WS connect, presence, typing, send, read, status
-.venv/bin/python tests/test_groups.py          # 35+ assertions: group CRUD, admin rules, system messages
-.venv/bin/python tests/test_replies.py         # 25+ assertions: parent_id validation, preview, truncation
-.venv/bin/python tests/test_reactions.py       # 26+ assertions: reactions, URL contract, full round-trip
-.venv/bin/python tests/test_emoji_storage.py   # 13 assertions: hex() round-trip, GET + DELETE consistency
-.venv/bin/python tests/test_disappearing.py    # timer set/get, sweep, delete broadcast, disable
-.venv/bin/python tests/test_seen_by.py         # seen_by enrichment on POST + GET
-```
-
-For Windows shells, set `PYTHONIOENCODING=utf-8` so emoji bytes print correctly in the test output.
-
 ## Project layout
 
 ```
@@ -373,7 +355,6 @@ backend/
 │       ├── manager.py       # ConnectionManager singleton
 │       ├── events.py        # TypedDicts for the WS protocol
 │       └── router.py        # /ws WebSocket
-├── tests/                   # scripted smoke tests (no pytest required)
 ├── .env.example
 ├── requirements.txt
 └── README.md
@@ -411,6 +392,6 @@ These are the decisions in `../PLAN.md` that constrain backend choices; flagged 
 3. State management (frontend): Zustand (UI) + TanStack Query (server)
 4. Styling (frontend): Tailwind v4 + `tokens.css`
 5. Bonus features: all 5 shipped (reply, reactions, dark mode, disappearing, attachments)
-6. Database: **SQLite everywhere** with WAL mode + single uvicorn worker + Railway Volume in prod
-7. Hosting: **Railway** (backend) + **Vercel** (frontend)
+6. Database: **SQLite everywhere** with WAL mode + single uvicorn worker + Render disk in prod
+7. Hosting: **Render** (backend) + **Vercel** (frontend)
 8. Visual theme (v1): **Light theme only** (dark mode deferred — frontend)

@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     # --- Database ---------------------------------------------------------
     database_url: str = Field(
         default="sqlite:///./app.db",
-        description="SQLAlchemy database URL. In prod, point at a Railway volume.",
+        description="SQLAlchemy database URL. In production, point at persistent storage.",
     )
 
     # --- JWT (used in Phase 2; declared now so .env is complete) ----------
