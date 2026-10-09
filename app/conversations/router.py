@@ -982,12 +982,26 @@ async def create_conversation(
     return service.to_conversation_out(db, conv, current_user_id=current_user.id)
 
 
+class GroupDetailsIn(BaseModel):
+    model_config = {"extra": "forbid"}
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    avatar_url: Optional[str] = Field(default=None, max_length=512)
+
+    @model_validator(mode="after")
+    def require_change(self):
+        if "name" not in self.model_fields_set and "avatar_url" not in self.model_fields_set:
+            raise ValueError("provide a group name or avatar_url to update")
+        if "name" in self.model_fields_set and (self.name is None or not self.name.strip()):
+            raise ValueError("group name cannot be blank")
+        return self
+
+
 class GroupAvatarIn(BaseModel):
     avatar_url: Optional[str] = Field(default=None, max_length=512)
 
 
 @router.patch("/conversations/{conversation_id}/avatar")
-def update_group_avatar(
+async def update_group_avatar(
     conversation_id: int,
     payload: GroupAvatarIn,
     current_user: User = Depends(get_current_user),
@@ -1003,7 +1017,53 @@ def update_group_avatar(
     conv.avatar_url = payload.avatar_url
     db.commit()
     db.refresh(conv)
+    participant_ids = [
+        uid for (uid,) in db.execute(
+            select(ConversationParticipant.user_id).where(
+                ConversationParticipant.conversation_id == conversation_id
+            )
+        ).all()
+    ]
+    updated = service.to_conversation_out(db, conv, current_user_id=current_user.id)
+    await connection_manager.broadcast_to_conversation(
+        conversation_id=conversation_id,
+        participant_ids=participant_ids,
+        payload={"type": "conversation.updated", "conversation": updated.model_dump(mode="json")},
+    )
     return {"avatar_url": conv.avatar_url}
+
+
+@router.patch("/conversations/{conversation_id}", response_model=ConversationOut)
+async def update_group_details(
+    conversation_id: int,
+    payload: GroupDetailsIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ConversationOut:
+    """Update a group's name and/or photo. Only group admins can do this."""
+    conv = _require_group(db, conversation_id)
+    _require_admin(db, conversation_id, current_user.id)
+    changes = payload.model_dump(exclude_unset=True)
+    if "name" in changes:
+        conv.name = changes["name"].strip() if changes["name"] is not None else None
+    if "avatar_url" in changes:
+        conv.avatar_url = changes["avatar_url"]
+    db.commit()
+    db.refresh(conv)
+    participant_ids = [
+        uid for (uid,) in db.execute(
+            select(ConversationParticipant.user_id).where(
+                ConversationParticipant.conversation_id == conversation_id
+            )
+        ).all()
+    ]
+    result = service.to_conversation_out(db, conv, current_user_id=current_user.id)
+    await connection_manager.broadcast_to_conversation(
+        conversation_id=conversation_id,
+        participant_ids=participant_ids,
+        payload={"type": "conversation.updated", "conversation": result.model_dump(mode="json")},
+    )
+    return result
 
 
 # --- POST /conversations/{id}/members -----------------------------------
@@ -1224,6 +1284,12 @@ async def remove_member(
         conversation_id=conversation_id,
         participant_ids=participant_ids,
         payload=conv_payload,
+    )
+    # Removed users are no longer in the participant set, so explicitly
+    # tell their live clients to drop this conversation from local state.
+    await connection_manager.send_to_user(
+        user_id=user_id,
+        payload={"type": "conversation.deleted", "conversation_id": conversation_id},
     )
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)

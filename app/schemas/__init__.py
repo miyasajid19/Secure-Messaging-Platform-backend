@@ -34,6 +34,12 @@ class MessagePreview(BaseModel):
     type: str  # 'text' | 'image' | 'system' — kept as string to avoid coupling
 
 
+class ConversationParticipantOut(UserOut):
+    """Participant entry with the member's group-level role."""
+
+    role: Optional[str] = None
+
+
 class ConversationOut(BaseModel):
     """One row in the conversation list.
 
@@ -57,7 +63,7 @@ class ConversationOut(BaseModel):
     last_message: Optional[MessagePreview] = None
     unread_count: int = 0
     avatar_url: Optional[str] = None
-    participants: List[UserOut] = Field(default_factory=list)
+    participants: List[ConversationParticipantOut] = Field(default_factory=list)
     members_can_be_added: bool = False
     my_role: Optional[str] = None  # 'admin' | 'member' | None (direct)
     # Phase 8.4: per-conversation default for new messages. NULL =

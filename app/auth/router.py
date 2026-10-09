@@ -28,6 +28,7 @@ from app.auth.jwt import encode_token
 from app.auth.otp import MOCK_OTP
 from app.auth.schemas import (
     ProfileUpdateIn,
+    ChangePhoneIn,
     RequestOtpIn,
     RequestOtpOut,
     UserOut,
@@ -155,6 +156,51 @@ def update_profile(
 
     db.refresh(current_user)
     return UserOut.model_validate(current_user)
+
+
+@router.post("/auth/change-phone", response_model=VerifyOtpOut)
+def change_phone(
+    payload: ChangePhoneIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> VerifyOtpOut:
+    """Change the account phone after OTP verification and rotate its JWT.
+
+    The replacement number must not already belong to another account.
+    The development OTP follows the existing mocked OTP auth flow.
+    """
+    if payload.otp != MOCK_OTP:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid OTP")
+    if payload.phone == current_user.phone:
+        raise HTTPException(status_code=400, detail="That is already your phone number")
+    existing = db.execute(select(User).where(User.phone == payload.phone)).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="Phone number is already in use")
+
+    current_user.phone = payload.phone
+    current_user.last_seen = datetime.now(timezone.utc)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Phone number is already in use") from exc
+    db.refresh(current_user)
+    token = encode_token(user_id=current_user.id, phone=current_user.phone)
+    return VerifyOtpOut(token=token, user=UserOut.model_validate(current_user))
+
+
+@router.post("/auth/change-phone/request-otp", response_model=RequestOtpOut)
+def request_phone_change_otp(
+    payload: RequestOtpIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> RequestOtpOut:
+    """Request a phone-change code without creating a second account row."""
+    if payload.phone == current_user.phone:
+        raise HTTPException(status_code=400, detail="That is already your phone number")
+    if db.execute(select(User.id).where(User.phone == payload.phone)).scalar_one_or_none() is not None:
+        raise HTTPException(status_code=409, detail="Phone number is already in use")
+    return RequestOtpOut(sent=True, debug_otp=MOCK_OTP)
 
 
 @router.post("/auth/upload-image", status_code=status.HTTP_201_CREATED)

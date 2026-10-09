@@ -26,6 +26,7 @@ from app.models import (
 )
 from app.schemas import (
     ConversationOut,
+    ConversationParticipantOut,
     MessagePreview,
     UserOut,
 )
@@ -189,6 +190,12 @@ def to_conversation_out(
     last_msg = get_last_message(db, conv.id)
     unread = get_unread_count(db, conv.id, current_user_id)
     participants = get_participants(db, conv.id)
+    participant_roles = {
+        participant.user_id: participant.role.value
+        for participant in db.query(ConversationParticipant).filter(
+            ConversationParticipant.conversation_id == conv.id,
+        ).all()
+    }
 
     is_group = conv.type.value == "group"
     if is_group:
@@ -220,7 +227,12 @@ def to_conversation_out(
         last_message=last_message_payload,
         unread_count=unread,
         avatar_url=avatar,
-        participants=[UserOut.model_validate(u) for u in participants],
+        participants=[
+            ConversationParticipantOut.model_validate(u).model_copy(
+                update={"role": participant_roles.get(u.id)}
+            )
+            for u in participants
+        ],
         members_can_be_added=is_group,
         my_role=my_role,
         disappear_after_seconds=conv.disappear_after_seconds,

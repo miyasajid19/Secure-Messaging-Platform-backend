@@ -154,6 +154,9 @@ All routes below require `Authorization: Bearer <token>` (the JWT issued by `/au
 | `POST` | `/auth/verify-otp` | — | Verify OTP, issue JWT. |
 | `GET` | `/auth/me` | ✅ | Current user. |
 | `PATCH` | `/auth/profile` | ✅ | Update display_name / username / avatar_url. Bumps `last_seen`. |
+| `POST` | `/auth/change-phone` | ✅ | Verify the new E.164 phone with OTP and return the updated user plus a replacement JWT. |
+| `POST` | `/auth/change-phone/request-otp` | ✅ | Request a phone-change OTP without creating a separate account. |
+| `POST` | `/auth/upload-image` | ✅ | Upload a profile/group photo through ImageKit; returns `{url}`. |
 | `POST` | `/auth/logout` | ✅ | Bump `last_seen`, force-close the user's WS, broadcast presence offline. JWT remains valid until `exp` (stateless). |
 | `GET` | `/conversations` | ✅ | Current user's conversations, sorted by `last_message_at DESC`. |
 | `GET` | `/conversations/{id}/messages?limit=50&before=<message_id>` | ✅ | Paginated messages, ASC. 403 if not a participant. |
@@ -163,8 +166,10 @@ All routes below require `Authorization: Bearer <token>` (the JWT issued by `/au
 | `GET` | `/conversations/{id}/disappearing-timer` | ✅ | Current `{disappear_after_seconds}` for the conversation. |
 | `PATCH` | `/conversations/{id}/disappearing-timer` | ✅ | Set the conversation timer (`3600`/`86400`/`604800`/`null`). |
 | `POST` | `/conversations` | ✅ | Create a group. Body `{type:"group", name, member_ids}`. Caller becomes admin. |
+| `PATCH` | `/conversations/{id}` | ✅ | Admin-only. Update group `name` and/or `avatar_url`; broadcasts the new conversation to members. |
+| `PATCH` | `/conversations/{id}/avatar` | ✅ | Admin-only. Update or clear group photo; broadcasts the change. |
 | `POST` | `/conversations/{id}/members` | ✅ | Admin-only. Add user. |
-| `DELETE` | `/conversations/{id}/members/{user_id}` | ✅ | Admin-only. Remove user. |
+| `DELETE` | `/conversations/{id}/members/{user_id}` | ✅ | Admin-only. Remove user and notify their connected clients. |
 | `PATCH` | `/conversations/{id}/members/{user_id}` | ✅ | Admin-only. Change role. |
 | `DELETE` | `/conversations/{id}` | ✅ | Admin-only. Cascade-delete the group. |
 | `GET` | `/contacts` | ✅ | Current user's contacts, newest first. |
@@ -173,7 +178,6 @@ All routes below require `Authorization: Bearer <token>` (the JWT issued by `/au
 | `GET` | `/users/online` | ✅ | List of currently-connected user ids. |
 | `POST` | `/messages/{id}/reactions` | ✅ | Add an emoji reaction. Body `{emoji}`. 201 + `ReactionGroup`. |
 | `DELETE` | `/messages/{id}/reactions/{emoji}` | ✅ | Remove a reaction. 204 on success. |
-| `POST` | `/auth/upload-image` | ✅ | (Phase 8.5) Upload an image attachment. Returns `{url, mime, size}`. Uses `IMAGEKIT_PRIVATE_KEY`. |
 | `WS` | `/ws?token=<jwt>` | ✅ (query) | Single bidirectional channel for `message.new`, `message.read.bulk`, `reactions.update`, `typing`, `presence`, `presence.snapshot`, `conversation.updated`, `conversation.deleted`, `message.delete`. |
 
 ## Auth (mocked OTP)

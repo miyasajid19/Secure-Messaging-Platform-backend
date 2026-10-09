@@ -69,3 +69,8 @@ class ProfileUpdateIn(BaseModel):
     display_name: Optional[str] = Field(default=None, max_length=128)
     username: Optional[str] = Field(default=None, max_length=64)
     avatar_url: Optional[str] = Field(default=None, max_length=512)
+
+
+class ChangePhoneIn(BaseModel):
+    phone: str = Field(min_length=3, max_length=32, pattern=r"^\+[1-9]\d{1,14}$")
+    otp: str = Field(min_length=1, max_length=16)
