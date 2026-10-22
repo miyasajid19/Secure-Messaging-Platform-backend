@@ -362,6 +362,7 @@ async def _handle_call_event(sender_id: int, data: dict) -> None:
             "call.offer": "call.offer",
             "call.answer": "call.answer",
             "call.ice": "call.ice",
+            "call.camera": "call.camera",
         }
         incoming_type = outgoing_types.get(event_type)
         if incoming_type is None:
@@ -384,6 +385,11 @@ async def _handle_call_event(sender_id: int, data: dict) -> None:
             if candidate is not None and not isinstance(candidate, dict):
                 return
             outgoing["candidate"] = candidate
+        elif event_type == "call.camera":
+            camera_off = data.get("camera_off")
+            if not isinstance(camera_off, bool):
+                return
+            outgoing["camera_off"] = camera_off
 
         delivered = await connection_manager.send_to_user(target_id, outgoing)
         if not delivered and event_type not in {"call.ice"}:
