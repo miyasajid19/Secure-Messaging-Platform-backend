@@ -302,9 +302,7 @@ def list_conversations(
     """List the current user's conversations, most-recent-activity first.
 
     Sort rule: `last_message_at DESC NULLS LAST`, with `created_at DESC`
-    as the tiebreaker for conversations that have no messages yet. SQLite
-    sorts NULLs first for `ASC` and last for `DESC`, so `ORDER BY ... DESC`
-    already gives us NULLS LAST here.
+    as the tiebreaker for conversations that have no messages yet.
     """
     # Subquery: ids of conversations the user is in.
     user_conv_ids = (
@@ -316,10 +314,8 @@ def list_conversations(
         db.execute(
             select(Conversation)
             .where(Conversation.id.in_(user_conv_ids))
-            # SQLite NULL ordering: NULLs are "smaller than" any value, so
-            # in a DESC sort they land last. Use COALESCE as a belt-and-
-            # suspenders guarantee that the ordering survives a future
-            # switch to a database where the default differs.
+            # COALESCE gives conversations with no messages a stable
+            # created_at-based sort position.
             .order_by(
                 func.coalesce(Conversation.last_message_at, Conversation.created_at).desc(),
                 Conversation.id.desc(),

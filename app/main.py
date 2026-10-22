@@ -20,6 +20,7 @@ from typing import AsyncIterator
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
 from app import models  # noqa: F401  (side-effect import for Base.metadata)
@@ -37,29 +38,6 @@ from sqlalchemy import select
 log = logging.getLogger("main")
 
 
-def _migrate_phase_8_4(engine) -> None:
-    """Add columns introduced after the initial conversation schema.
-
-    `create_all` only creates missing tables, not missing columns on
-    existing tables. For dev/demo we run a one-shot check + ALTER
-    on every startup; the check is one `PRAGMA table_info` query so
-    the no-op path is cheap. If/when Alembic lands, this whole
-    function goes away.
-    """
-    with engine.connect() as conn:
-        cols = [row[1] for row in conn.execute(text("PRAGMA table_info(conversations)")).all()]
-        if "disappear_after_seconds" not in cols:
-            conn.execute(
-                text("ALTER TABLE conversations ADD COLUMN disappear_after_seconds INTEGER")
-            )
-            conn.commit()
-        if "avatar_url" not in cols:
-            conn.execute(
-                text("ALTER TABLE conversations ADD COLUMN avatar_url VARCHAR(512)")
-            )
-            conn.commit()
-
-
 # Phase 8.4: sweep interval. The spec says 30s; that's the cadence at
 # which we scan for expired messages. The actual expiry resolution is
 # `disappear_after_seconds` (1h / 1d / 1w) so a 30s cadence is fine
@@ -74,8 +52,8 @@ async def _sweep_disappearing_once() -> int:
     background task (every 30s) and the smoke test (synchronously,
     for determinism).
 
-    The DELETE uses SQLite's `RETURNING` to fetch the deleted
-    rows' ids + conversation_ids in one round-trip. We then look
+    PostgreSQL's DELETE RETURNING fetches the deleted rows' IDs and
+    conversation IDs in one round-trip. We then look
     up the participant list per conversation and broadcast.
     """
     with engine.connect() as conn:
@@ -83,12 +61,10 @@ async def _sweep_disappearing_once() -> int:
             text(
                 "DELETE FROM messages "
                 "WHERE disappear_after_seconds IS NOT NULL "
-                # Compare as Julian days: SQLAlchemy stores timezone-aware
-                # datetimes with an ISO `T`, while SQLite datetime() returns
-                # a space separator. Text comparison can otherwise miss
-                # expirations within the same day.
-                "  AND julianday(created_at) < "
-                "      julianday('now', '-' || disappear_after_seconds || ' seconds') "
+                # Use the database clock so timestamp comparisons stay
+                # consistent across application instances.
+                "  AND created_at < CURRENT_TIMESTAMP "
+                "      - (disappear_after_seconds * INTERVAL '1 second') "
                 "RETURNING id, conversation_id"
             )
         )
@@ -151,11 +127,10 @@ async def _disappearing_sweeper_task() -> None:
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Run on startup/shutdown.
 
-    A cheap SELECT 1 confirms the DB engine can hand out a working connection
-    and that the WAL pragmas in database.py were applied successfully. We
-    also call `Base.metadata.create_all` so a fresh `./app.db` is provisioned
-    with the schema. The call is idempotent: existing tables are left
-    alone, missing ones are created.
+    A cheap SELECT 1 confirms the PostgreSQL database is reachable. We also
+    call `Base.metadata.create_all` so a fresh database is provisioned with
+    the current schema. This creates missing tables and does not import or
+    copy any SQLite data.
 
     The realtime typing-expiry sweeper is started here so the lifecycle
     is symmetric: a started task gets a stopped task. The
@@ -174,12 +149,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     finally:
         db.close()
 
-    # create_all is safe to call repeatedly: SQLAlchemy emits CREATE TABLE
-    # IF NOT EXISTS, so a warm restart doesn't error. It does NOT add
-    # columns to existing tables — see the Phase 8.4 migration below
-    # for the new conversations.disappear_after_seconds column.
+    # The configured PostgreSQL database is fresh; create_all provisions its
+    # current schema without copying data from the former local database.
     Base.metadata.create_all(bind=engine)
-    _migrate_phase_8_4(engine)
 
     # Start the typing-expiry sweeper (one background task per process).
     await connection_manager.start()
@@ -187,8 +159,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # Phase 8.4: start the disappearing-message sweeper.
     disappearing_task = asyncio.create_task(_disappearing_sweeper_task())
 
+    safe_database_url = make_url(settings.database_url).render_as_string(hide_password=True)
     print(
-        f"[startup] DB OK ({settings.database_url}); tables ensured; "
+        f"[startup] PostgreSQL OK ({safe_database_url}); tables ensured; "
         f"realtime sweeper running; disappearing-message sweeper running"
     )
     try:

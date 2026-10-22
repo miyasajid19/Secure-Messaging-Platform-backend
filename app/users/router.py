@@ -29,9 +29,8 @@ router = APIRouter(tags=["users"])
 _SEARCH_LIMIT = 20
 
 
-# `func.lower()` is the portable way to express case-insensitive
-# matching across SQLite + Postgres. Defining it once at module scope
-# keeps the query expression readable.
+# `func.lower()` expresses case-insensitive matching in PostgreSQL.
+# Defining it once at module scope keeps the query expression readable.
 func_lower = func.lower
 
 

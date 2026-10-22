@@ -1,10 +1,8 @@
 """In-memory WebSocket connection manager.
 
-State lives in this single object for the whole uvicorn process. We
-deliberately don't reach for Redis or any cross-process primitive
-because the project is locked to a single uvicorn worker — see
-PLAN.md "SQLite production config". If/when we move to multiple
-workers, this whole module is the swap point.
+State lives in this single object for the whole uvicorn process. The
+application currently runs a single uvicorn worker; presence and typing
+remain process-local even though persistence uses PostgreSQL.
 
 Concurrency:
   - All mutation methods acquire `_lock` before reading/writing the

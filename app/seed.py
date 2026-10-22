@@ -702,9 +702,8 @@ def _seed(db: Session) -> None:
     for msg in (
         db.query(Message).all()
     ):
-        # SQLite drops timezone metadata from DateTime(timezone=True) values.
-        # Seed timestamps are UTC, so restore UTC before comparing them with
-        # the timezone-aware cutoff. Postgres values remain unchanged.
+        # Treat any legacy naive timestamp as UTC before comparing with the
+        # timezone-aware cutoff. PostgreSQL stores timezone-aware values.
         created_at = msg.created_at
         if created_at is not None and created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)

@@ -1,6 +1,6 @@
 # Secure Messaging Platform — Backend
 
-FastAPI + SQLAlchemy 2.x + SQLite (WAL) backend for the Signal Messenger clone assignment. Serves a REST API for auth, conversations, contacts, and message CRUD, plus a single WebSocket endpoint for real-time messaging, presence, typing, and reactions. Single uvicorn worker (locked decision — see below).
+FastAPI + SQLAlchemy 2.x + PostgreSQL backend for the Signal Messenger clone. Serves REST APIs and a WebSocket endpoint for real-time messaging, presence, typing, and reactions.
 
 The frontend lives at `../frontend/` (Next.js 16 App Router, Vercel-deployed). The full architecture is documented in `../PLAN.md`.
 
@@ -14,9 +14,8 @@ The frontend lives at `../frontend/` (Next.js 16 App Router, Vercel-deployed). T
 └────────────────────┘                                  └─────────┬──────────┘
                                                                   │
                                                           ┌───────▼────────┐
-                                                          │ SQLite + WAL    │
-                                                          │ (Render Disk    │
-                                                          │  /data/app.db)  │
+                                                          │ PostgreSQL      │
+                                                          │ (Aiven / hosted)│
                                                           └────────────────┘
 ```
 
@@ -31,7 +30,7 @@ Three layers:
 |---|---|---|
 | Framework | FastAPI 0.115+ | Async; built-in WebSocket support |
 | ORM | SQLAlchemy 2.x | Typed declarative (`Mapped[...]`, `mapped_column`) |
-| DB | SQLite 3 (WAL mode) | Single file on a Render disk mounted at `/data` |
+| DB | PostgreSQL | External PostgreSQL service; connection URL from environment |
 | Auth | PyJWT (HS256) | Stateless; expiry 7 days |
 | Realtime | FastAPI WebSocket + asyncio | In-memory pub/sub by conversation |
 | Python | 3.11+ | `.python-version` pinned |
@@ -48,7 +47,7 @@ source .venv/bin/activate   # bash/zsh
 # .venv\Scripts\activate.ps1   # Windows PowerShell
 
 pip install -r requirements.txt
-cp .env.example .env       # provides dev defaults (JWT_SECRET, CORS_ORIGINS, etc.)
+cp .env.example .env       # set AIVEN_DATABASE_URI or DATABASE_URL to PostgreSQL
 
 # Seed the demo DB
 python -m app.seed
@@ -58,35 +57,33 @@ uvicorn app.main:app --reload
 # Server: http://localhost:8000  ·  Docs: http://localhost:8000/docs
 ```
 
-On startup the app calls `Base.metadata.create_all` (idempotent) and runs a `[startup] DB OK (sqlite:///./app.db)` log line. `/health` returns the row counts per table.
+On startup the app creates missing tables in the configured PostgreSQL database. It does not copy any records from the former SQLite database. `/health` returns row counts per table.
 
 **Verify:**
 
 ```bash
 curl http://localhost:8000/health
-# -> {"status":"ok","db":"reachable","counts":{"users":7,"contacts":6,"conversations":12,...}}
-
-sqlite3 app.db "PRAGMA journal_mode;"
-# -> wal
+# -> {"status":"ok","db":"reachable","counts":{"users":0,"contacts":0,"conversations":0,...}}
 ```
 
 ## Deployment (Render)
 
-Create a Render **Web Service** from this GitHub repository and select the Docker runtime. Render builds the root `Dockerfile` and runs its `CMD` by default. Leave Render's Docker Command blank so the seed step is preserved.
+Create a Render **Web Service** from this GitHub repository and select the Docker runtime. Render builds the root `Dockerfile` and runs its `CMD` by default. Configure a PostgreSQL connection URL in the service environment.
 
-1. Attach a persistent disk with mount path `/data` (available on paid web services). Set `DATABASE_URL=sqlite:////data/app.db`. Without a disk, the database file is ephemeral and will be reseeded from scratch after a restart or deploy. A disk-backed service runs one instance and has a brief interruption during deploys.
-2. Keep one service instance and one Uvicorn worker. The connection manager and disappearing-message sweeper keep state in process memory. Render disks are limited to one service instance.
+1. Set `DATABASE_URL` to your PostgreSQL connection URL, or set `AIVEN_DATABASE_URI` when using Aiven. The app will create an empty schema on first startup; SQLite data is not copied.
+2. Keep one Uvicorn worker because the connection manager and disappearing-message sweeper keep state in process memory.
 3. Add the production environment variables in the Render service's Environment tab. Do not copy the local `.env` file or use the development JWT secret.
 4. Set the health check path to `/health`. The Dockerfile binds to `0.0.0.0` and defaults to Render's `PORT` value of `10000`.
 5. Enable auto-deploy for the connected Git branch if you want each push to redeploy. After pushing, check the deploy logs and open `https://<your-service>.onrender.com/health` to confirm the database is reachable.
 
-The Docker start command runs `python -m app.seed` before Uvicorn on every container start. The seed script checks for its demo-user sentinel and does nothing when the database is already seeded, so restarts and redeploys do not duplicate the demo data. Render pre-deploy commands run on a separate instance without the persistent disk, so the startup command is used for seeding.
+Demo data is opt-in: run `python -m app.seed` manually only when you want sample users and conversations. The Docker startup does not seed rows.
 
 ### Env vars (production)
 
 | Var | Required | Example | Notes |
 |---|---|---|---|
-| `DATABASE_URL` | yes | `sqlite:////data/app.db` | Absolute path to the Volume file. |
+| `DATABASE_URL` | yes unless using Aiven URI | `postgresql://user:password@host:port/database?sslmode=require` | PostgreSQL SQLAlchemy URL. |
+| `AIVEN_DATABASE_URI` | yes when using Aiven | `postgres://user:password@host:port/database?sslmode=require` | Used if `DATABASE_URL` is blank or still points to legacy SQLite. |
 | `JWT_SECRET` | yes | `<random 64-char hex>` | Used to sign JWTs. **Never ship the dev default in prod.** |
 | `JWT_ALGORITHM` | no | `HS256` | |
 | `JWT_EXPIRES_MINUTES` | no | `10080` | 7 days. |
@@ -112,7 +109,7 @@ The Docker start command runs `python -m app.seed` before Uvicorn on every conta
 | `message_reactions` | `message_id, user_id, emoji (VARCHAR 16), created_at` | UNIQUE on `(message_id, user_id, emoji)`. UTF-8 round-trip safe. |
 | `attachments` | `message_id, url, mime, size_bytes` | Populated by the image upload flow. |
 
-`Base.metadata.create_all(engine)` runs on startup and from `python -m app.seed`. Idempotent. No Alembic; not needed at this scale.
+`Base.metadata.create_all(engine)` creates the schema at startup and when the optional seed script is run. No migration from SQLite is performed.
 
 ## Environment variables (full)
 
@@ -120,7 +117,8 @@ All settings live in `app/config.py` (`pydantic-settings.BaseSettings`) and load
 
 | Var | Default | Notes |
 |---|---|---|
-| `DATABASE_URL` | `sqlite:///./app.db` | SQLAlchemy URL. In prod, `sqlite:////data/app.db` (note the 4 slashes — `//` is the URL scheme separator, `//data/...` is the absolute path). |
+| `DATABASE_URL` | (required) | PostgreSQL URL. If blank or legacy SQLite, `AIVEN_DATABASE_URI` is used. |
+| `AIVEN_DATABASE_URI` | (empty) | Aiven PostgreSQL URL fallback. |
 | `JWT_SECRET` | `change-me-in-prod` | HMAC secret. **Override in prod.** |
 | `JWT_ALGORITHM` | `HS256` | |
 | `JWT_EXPIRES_MINUTES` | `10080` | 7 days. |
@@ -287,7 +285,7 @@ curl -s -X PATCH http://localhost:8000/conversations/1/disappearing-timer \
 | `DELETE` | `/messages/{id}/reactions/{emoji}` | — | 204 / 404 |
 | `GET` | `/messages/{id}/reactions` | — | 405 by design |
 
-Emoji storage is UTF-8 round-trip safe. `sqlite3 app.db "SELECT hex(emoji) FROM message_reactions"` on a posted 👍 shows `F09F918D`, not `3F3F`.
+Emoji storage is UTF-8 round-trip safe in PostgreSQL.
 
 ## Groups
 
@@ -314,7 +312,7 @@ backend/
 │   ├── __init__.py
 │   ├── main.py              # FastAPI app, /health, create_all, lifespan sweepers
 │   ├── config.py            # pydantic-settings BaseSettings
-│   ├── database.py          # SQLAlchemy engine, WAL pragmas, get_db
+│   ├── database.py          # PostgreSQL SQLAlchemy engine and get_db
 │   ├── seed.py              # python -m app.seed (idempotent)
 │   ├── auth/                # Firebase phone auth + JWT
 │   │   ├── jwt.py           # encode/decode (HS256, iss, exp)
@@ -346,14 +344,13 @@ backend/
 - `create_all` keeps dev and prod in lockstep while we're the only writer to the DB.
 - When the schema stops being trivially mutable, revisit.
 
-To wipe state: `rm app.db app.db-wal app.db-shm && python -m app.seed`.
+The application starts with a fresh database schema and no imported rows. To reset a PostgreSQL database, create a new empty database and point `DATABASE_URL` or `AIVEN_DATABASE_URI` at it; the app will create its tables at startup.
 
 ## Known limitations
 
 These are intentional, locked decisions for this assignment's scope:
 
 - **Single uvicorn worker.** The connection manager and the disappearing-message sweep are in-memory process state. Running `--workers N>1` would split them across processes and break presence/typing and sweep delivery.
-- **SQLite single-writer.** Sufficient for the demo; horizontal scaling would need Postgres.
 - **JWT is stateless.** `/auth/logout` doesn't invalidate the token (no `token_version` column); the frontend drops the token on logout to close the loop.
 - **No WebSocket heartbeat.** A connection that drops without a clean close frame leaves the user marked "online" until they reconnect. The 6-second typing TTL partially mitigates. Acceptable for the demo.
 - **In-memory typing / presence state.** Resets on every server restart.
@@ -369,6 +366,6 @@ These are the decisions in `../PLAN.md` that constrain backend choices; flagged 
 3. State management (frontend): Zustand (UI) + TanStack Query (server)
 4. Styling (frontend): Tailwind v4 + `tokens.css`
 5. Bonus features: all 5 shipped (reply, reactions, dark mode, disappearing, attachments)
-6. Database: **SQLite everywhere** with WAL mode + single uvicorn worker + Render disk in prod
+6. Database: **PostgreSQL**; no SQLite compatibility or data migration
 7. Hosting: **Render** (backend) + **Vercel** (frontend)
 8. Visual theme (v1): **Light theme only** (dark mode deferred — frontend)

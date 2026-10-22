@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,10 +21,8 @@ class Settings(BaseSettings):
     """
 
     # --- Database ---------------------------------------------------------
-    database_url: str = Field(
-        default="sqlite:///./app.db",
-        description="SQLAlchemy database URL. In production, point at persistent storage.",
-    )
+    database_url: str = Field(default="", description="PostgreSQL SQLAlchemy URL.")
+    aiven_database_uri: str = Field(default="", description="Aiven PostgreSQL connection URI.")
 
     # --- JWT (used in Phase 2; declared now so .env is complete) ----------
     jwt_secret: str = Field(
@@ -59,6 +57,25 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def require_postgres_database(self) -> "Settings":
+        """Use PostgreSQL only; prefer DATABASE_URL when it is PostgreSQL.
+
+        A legacy SQLite DATABASE_URL is ignored when an Aiven PostgreSQL URI
+        is present, which lets existing local .env files switch over safely.
+        """
+        raw_url = self.database_url.strip()
+        if not raw_url or raw_url.lower().startswith("sqlite:"):
+            raw_url = self.aiven_database_uri.strip()
+        if raw_url.startswith("postgres://"):
+            raw_url = "postgresql+psycopg://" + raw_url[len("postgres://"):]
+        elif raw_url.startswith("postgresql://"):
+            raw_url = "postgresql+psycopg://" + raw_url[len("postgresql://"):]
+        if not raw_url.startswith("postgresql+psycopg://"):
+            raise ValueError("Set DATABASE_URL or AIVEN_DATABASE_URI to a PostgreSQL connection URI")
+        self.database_url = raw_url
+        return self
 
     @property
     def cors_origins_list(self) -> List[str]:

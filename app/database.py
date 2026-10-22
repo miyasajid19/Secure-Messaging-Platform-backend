@@ -1,59 +1,22 @@
-"""SQLAlchemy engine, session factory, and FastAPI dependency.
-
-Locked SQLite config (see PLAN.md "SQLite production config"):
-  - WAL journal mode on every connection
-  - sync ORM (SQLAlchemy 2.x)
-  - one Session per request, properly closed
-  - single uvicorn worker (documented in README) to avoid cross-process
-    write contention
-"""
+"""PostgreSQL engine, session factory, and FastAPI dependency."""
 
 from typing import Generator
 
-from sqlalchemy import create_engine, event
-from sqlalchemy.engine import Engine
+from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
 
 
 # --- Engine ----------------------------------------------------------------
-# `check_same_thread=False` is required for SQLite when used across threads
-# (uvicorn's threadpool, FastAPI's dependency injection). SQLAlchemy's
-# connection pool still scopes each Session to one thread, so this is safe.
 _settings = get_settings()
 engine = create_engine(
     _settings.database_url,
     echo=False,
     future=True,
-    connect_args={"check_same_thread": False} if _settings.database_url.startswith("sqlite") else {},
+    pool_pre_ping=True,
+    pool_recycle=1800,
 )
-
-
-# --- WAL mode (and friends) on every new connection ------------------------
-# Event listeners fire per-connection, which matters because SQLite's
-# `journal_mode` is a per-connection setting. Without this listener, a new
-# connection in the pool could end up in the default (delete) journal mode.
-@event.listens_for(Engine, "connect")
-def _set_sqlite_pragmas(dbapi_connection, connection_record):  # noqa: ANN001
-    """Enable WAL + a couple of durability/foreign-key pragmas.
-
-    WAL lets readers proceed concurrently with a single writer — required
-    for the chat workload where many WS clients will SELECT while a small
-    number of writes happen.
-    """
-    # Only run SQLite-specific pragmas on SQLite connections; this listener
-    # also fires for non-SQLite URLs if we ever swap the engine in tests.
-    is_sqlite = _settings.database_url.startswith("sqlite")
-    if not is_sqlite:
-        return
-
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA synchronous=NORMAL")  # safe with WAL; faster than FULL
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.execute("PRAGMA busy_timeout=5000")  # ms; reduces SQLITE_BUSY under load
-    cursor.close()
 
 
 # --- Session factory -------------------------------------------------------

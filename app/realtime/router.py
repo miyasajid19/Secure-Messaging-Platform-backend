@@ -62,7 +62,7 @@ def _db_session():
 
     WebSockets are long-lived but SQLAlchemy sessions aren't — we open
     a fresh one for each DB op. The `SessionLocal` factory from
-    app.database is the same one the HTTP routes use, so WAL pragmas
+    app.database is the same one the HTTP routes use, so pooling
     and engine config stay consistent.
     """
     return SessionLocal()

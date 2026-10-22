@@ -2,7 +2,7 @@
 
 Centralized so that adding a new value (e.g. a new message type) is a single
 edit. SQLAlchemy's `Enum(..., native_enum=False)` stores these as VARCHAR —
-better for SQLite portability and easier to read in `sqlite3` CLI dumps.
+keeping enum values readable in the PostgreSQL schema.
 """
 
 import enum
