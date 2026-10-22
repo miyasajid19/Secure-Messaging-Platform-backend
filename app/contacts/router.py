@@ -143,7 +143,7 @@ def add_contact(
 
     Status codes:
       - 404: target user not found (we don't auto-create here; that's
-        request-otp's job).
+        sign-in's job).
       - 409: target is already a contact.
       - 200: contact created, conversation (new or existing) returned.
     """

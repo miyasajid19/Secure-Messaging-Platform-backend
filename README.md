@@ -93,6 +93,8 @@ The Docker start command runs `python -m app.seed` before Uvicorn on every conta
 | `JWT_ISSUER` | no | `signal-clone` | `iss` claim; mismatched tokens are rejected. |
 | `CORS_ORIGINS` | yes | `https://your-app.vercel.app` | Comma-separated. The Vercel domain only — don't allow `localhost` in prod. |
 | `IMAGEKIT_PRIVATE_KEY` | only for attachments | `<key>` | ImageKit server-side upload key for chat attachments. Optional — composer hides the paperclip if missing. |
+| `FIREBASE_API_KEY` | yes for phone auth | `<web-api-key>` | Used server-side to call Firebase's phone verification REST API. |
+| `FIREBASE_PROJECT_ID` | yes for phone auth | `<project-id>` | Must match the Firebase project used by the frontend. |
 
 
 ## Database schema
@@ -101,7 +103,7 @@ The Docker start command runs `python -m app.seed` before Uvicorn on every conta
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `users` | `id, phone (unique), username, display_name, avatar_url, password_hash (unused), last_seen, created_at` | Created by `request-otp` even before login (registration). |
+| `users` | `id, phone (unique), username, display_name, avatar_url, password_hash (unused), last_seen, created_at` | Created after Firebase verifies the phone during login. |
 | `contacts` | `owner_id, contact_id, nickname, added_at` | UNIQUE on `(owner_id, contact_id)`. |
 | `conversations` | `id, type ('direct'\|'group'), name, disappear_after_seconds, last_message_at, created_at` | `last_message_at` indexed for the list query. |
 | `conversation_participants` | `conversation_id, user_id, joined_at, role ('admin'\|'member')` | UNIQUE on `(conversation_id, user_id)`. |
@@ -133,12 +135,11 @@ All routes below require `Authorization: Bearer <token>` (the JWT issued by `/au
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET` | `/health` | — | Row counts per table (smoke check). |
-| `POST` | `/auth/request-otp` | — | Upsert user by phone. OTP is always `123456`. |
-| `POST` | `/auth/verify-otp` | — | Verify OTP, issue JWT. |
+| `POST` | `/auth/request-otp` | — | Send Firebase SMS after validating browser reCAPTCHA proof. Body: `{phone, recaptcha_token}`; returns `{session_info}`. |
+| `POST` | `/auth/verify-otp` | — | Verify the submitted OTP with Firebase, then issue app JWT. Body: `{phone, session_info, code}`. |
 | `GET` | `/auth/me` | ✅ | Current user. |
 | `PATCH` | `/auth/profile` | ✅ | Update display_name / username / avatar_url. Bumps `last_seen`. |
-| `POST` | `/auth/change-phone` | ✅ | Verify the new E.164 phone with OTP and return the updated user plus a replacement JWT. |
-| `POST` | `/auth/change-phone/request-otp` | ✅ | Request a phone-change OTP without creating a separate account. |
+| `POST` | `/auth/change-phone` | ✅ | Verify `{phone, session_info, code}` with Firebase and return updated user plus replacement JWT. |
 | `POST` | `/auth/upload-image` | ✅ | Upload a profile/group photo through ImageKit; returns `{url}`. |
 | `POST` | `/auth/logout` | ✅ | Bump `last_seen`, force-close the user's WS, broadcast presence offline. JWT remains valid until `exp` (stateless). |
 | `GET` | `/conversations` | ✅ | Current user's conversations, sorted by `last_message_at DESC`. |
@@ -164,21 +165,20 @@ All routes below require `Authorization: Bearer <token>` (the JWT issued by `/au
 | `DELETE` | `/messages/{id}/reactions/{emoji}` | ✅ | Remove a reaction. 204 on success. |
 | `WS` | `/ws?token=<jwt>` | ✅ (query) | Single bidirectional channel for `message.new`, `message.read.bulk`, `reactions.update`, `typing`, `presence`, `presence.snapshot`, `conversation.updated`, `conversation.deleted`, `message.delete`. |
 
-## Auth (mocked OTP)
+## Auth (Firebase Phone Authentication)
 
-The OTP is the constant `123456`. There is no SMS or email — `/auth/request-otp` returns a `debug_otp` field so the dev frontend can autofill. **Remove or gate that field via env before deploying to a real environment.**
+The frontend obtains Firebase's required browser reCAPTCHA proof, then asks the backend to request the SMS through Firebase. The backend returns an opaque Firebase `session_info`; the frontend submits that and the code to `/auth/verify-otp`, where the backend asks Firebase to validate it before issuing the app JWT. The backend also validates the Firebase ID token returned by Firebase and requires its verified phone claim to match the submitted E.164 number. `/auth/change-phone` uses the same backend verification flow for the replacement number.
+
+Set `FIREBASE_API_KEY` and `FIREBASE_PROJECT_ID` in the backend environment. Set the Firebase web app values as `NEXT_PUBLIC_FIREBASE_*` in the frontend environment (`frontend/.env.local` locally and the frontend host environment in production). These web config values are public; do not put service-account private keys in frontend variables. Enable Phone sign-in and configure SMS region policy in Firebase Console, and authorize the app's domains. Firebase test phone numbers can be set up in Firebase Console for development; the app no longer accepts the fixed `123456` mock code.
+
+Both frontend and backend validate E.164 phone format, and the backend checks that the Firebase verified phone exactly matches the submitted number.
 
 ```bash
-# 1. Request an OTP (upserts the user)
-curl -s -X POST http://localhost:8000/auth/request-otp \
-  -H 'Content-Type: application/json' \
-  -d '{"phone":"+15550000099"}'
-# -> {"sent":true,"debug_otp":"123456"}
-
-# 2. Verify — issues a JWT
+# After Firebase has completed SMS verification, exchange its ID token for
+# the app JWT (ID_TOKEN is obtained from the Firebase client SDK).
 TOKEN=$(curl -s -X POST http://localhost:8000/auth/verify-otp \
   -H 'Content-Type: application/json' \
-  -d '{"phone":"+15550000099","otp":"123456"}' \
+  -d '{"phone":"+15550000099","firebase_id_token":"'"$ID_TOKEN"'"}' \
   | python -c 'import sys,json; print(json.load(sys.stdin)["token"])')
 
 # 3. /auth/me with the token
@@ -235,10 +235,9 @@ The JWT payload: `{sub: user_id, phone, iat, exp, iss:"signal-clone"}`, HS256-si
 ## Read API
 
 ```bash
-TOKEN=$(curl -s -X POST http://localhost:8000/auth/verify-otp \
-  -H 'Content-Type: application/json' \
-  -d '{"phone":"+919000000001","otp":"123456"}' \
-  | python -c "import sys,json; print(json.load(sys.stdin)['token'])")
+# Sign in through the frontend with Firebase Phone Authentication first,
+# then use its app JWT for these authenticated API examples.
+TOKEN=<app-jwt-from-frontend-login>
 H="Authorization: Bearer $TOKEN"
 
 # Conversations
@@ -317,10 +316,10 @@ backend/
 │   ├── config.py            # pydantic-settings BaseSettings
 │   ├── database.py          # SQLAlchemy engine, WAL pragmas, get_db
 │   ├── seed.py              # python -m app.seed (idempotent)
-│   ├── auth/                # mocked OTP + JWT
+│   ├── auth/                # Firebase phone auth + JWT
 │   │   ├── jwt.py           # encode/decode (HS256, iss, exp)
-│   │   ├── otp.py           # constant 123456
-│   │   ├── schemas.py       # RequestOtp, VerifyOtp, ProfileUpdate, UserOut, Logout
+│   │   ├── firebase.py      # verify Firebase ID token + verified phone
+│   │   ├── schemas.py       # VerifyOtp, ProfileUpdate, UserOut, Logout
 │   │   ├── deps.py          # get_current_user
 │   │   └── router.py        # /auth/* including /logout + /upload-image
 │   ├── schemas/             # Pydantic response models
@@ -356,7 +355,6 @@ These are intentional, locked decisions for this assignment's scope:
 - **Single uvicorn worker.** The connection manager and the disappearing-message sweep are in-memory process state. Running `--workers N>1` would split them across processes and break presence/typing and sweep delivery.
 - **SQLite single-writer.** Sufficient for the demo; horizontal scaling would need Postgres.
 - **JWT is stateless.** `/auth/logout` doesn't invalidate the token (no `token_version` column); the frontend drops the token on logout to close the loop.
-- **Mocked OTP.** No SMS/email; OTP is always `123456`. The `debug_otp` field in `/auth/request-otp` responses exists to let the dev frontend autofill — gate or strip in real deploys.
 - **No WebSocket heartbeat.** A connection that drops without a clean close frame leaves the user marked "online" until they reconnect. The 6-second typing TTL partially mitigates. Acceptable for the demo.
 - **In-memory typing / presence state.** Resets on every server restart.
 - **WS auth via `?token=` query param.** Cookies don't survive cross-origin WS upgrades reliably; the locked pattern is `?token=<jwt>`. The HTTP REST contract uses `Authorization: Bearer` — they're parallel, not interchangeable.

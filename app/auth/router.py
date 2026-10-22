@@ -1,8 +1,7 @@
-"""Auth router: mocked-OTP login + JWT issue + protected profile/me/logout.
+"""Auth router: Firebase phone identity exchange + protected profile/me/logout.
 
 Endpoints:
-  POST /auth/request-otp   — public, upsert user by phone
-  POST /auth/verify-otp    — public, issue JWT
+  POST /auth/verify-otp    — public, verify Firebase ID token and issue app JWT
   GET  /auth/me            — protected, return current user
   PATCH /auth/profile      — protected, update display fields + bump last_seen
   POST /auth/logout        — protected, close WS + presence offline + bump last_seen
@@ -24,8 +23,9 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.auth.deps import get_current_user
+from app.auth.firebase import FirebaseAuthUnavailable, verified_phone_from_token
+from app.auth.firebase_otp import FirebaseOtpError, request_phone_code, verify_phone_code
 from app.auth.jwt import encode_token
-from app.auth.otp import MOCK_OTP
 from app.auth.schemas import (
     ProfileUpdateIn,
     ChangePhoneIn,
@@ -49,11 +49,8 @@ router = APIRouter(tags=["auth"])
 def _get_or_create_user_by_phone(db: Session, phone: str) -> User:
     """Upsert a user row keyed on phone.
 
-    On a fresh phone we create a stub with all profile fields NULL; the
-    user fills them in via PATCH /auth/profile. The "request-otp then
-    verify-otp" sequence means verify-otp can also create the user if
-    the frontend skipped request-otp (e.g. on a retry). Both endpoints
-    share this helper so the upsert rule lives in one place.
+    On a fresh, Firebase-verified phone we create a stub with all profile
+    fields NULL; the user fills them in via PATCH /auth/profile.
     """
     user = db.execute(select(User).where(User.phone == phone)).scalar_one_or_none()
     if user is not None:
@@ -70,37 +67,33 @@ def _get_or_create_user_by_phone(db: Session, phone: str) -> User:
     return user
 
 
-# --- /auth/request-otp --------------------------------------------------
+# --- /auth/request-otp + /auth/verify-otp -------------------------------
 
 
 @router.post("/auth/request-otp", response_model=RequestOtpOut)
-def request_otp(payload: RequestOtpIn, db: Session = Depends(get_db)) -> RequestOtpOut:
-    """Upsert the user and echo the (mocked) OTP for the dev frontend.
-
-    Status 200 regardless of whether the user is new or existing — the
-    spec is that the response shape is constant. We deliberately don't
-    reveal which case we hit (privacy: a probing client shouldn't be
-    able to enumerate which phones are already registered).
-    """
-    _get_or_create_user_by_phone(db, payload.phone)
-    db.commit()
-    return RequestOtpOut(sent=True, debug_otp=MOCK_OTP)
-
-
-# --- /auth/verify-otp ---------------------------------------------------
+async def request_otp(payload: RequestOtpIn) -> RequestOtpOut:
+    """Ask Firebase to send a real SMS; the browser supplies reCAPTCHA proof."""
+    try:
+        session_info = await request_phone_code(payload.phone, payload.recaptcha_token)
+    except FirebaseOtpError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return RequestOtpOut(session_info=session_info)
 
 
 @router.post("/auth/verify-otp", response_model=VerifyOtpOut)
-def verify_otp(payload: VerifyOtpIn, db: Session = Depends(get_db)) -> VerifyOtpOut:
-    """Validate the mocked OTP and issue a JWT.
-
-    401 for any wrong OTP. The user is upserted here too so the
-    frontend can skip request-otp on a retry after a 401.
-    """
-    if payload.otp != MOCK_OTP:
+async def verify_otp(payload: VerifyOtpIn, db: Session = Depends(get_db)) -> VerifyOtpOut:
+    """Ask Firebase to validate the SMS code, then issue the app JWT."""
+    try:
+        result = await verify_phone_code(payload.session_info, payload.code)
+        verified_phone = verified_phone_from_token(result["id_token"])
+    except FirebaseAuthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except FirebaseOtpError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if verified_phone != payload.phone or result["phone"] != payload.phone:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid OTP",
+            detail="Firebase token does not verify this phone number",
         )
 
     user = _get_or_create_user_by_phone(db, payload.phone)
@@ -159,18 +152,25 @@ def update_profile(
 
 
 @router.post("/auth/change-phone", response_model=VerifyOtpOut)
-def change_phone(
+async def change_phone(
     payload: ChangePhoneIn,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> VerifyOtpOut:
-    """Change the account phone after OTP verification and rotate its JWT.
+    """Change the account phone after Firebase verifies it and rotate the JWT.
 
     The replacement number must not already belong to another account.
-    The development OTP follows the existing mocked OTP auth flow.
+    The Firebase token must belong to the newly verified phone.
     """
-    if payload.otp != MOCK_OTP:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid OTP")
+    try:
+        result = await verify_phone_code(payload.session_info, payload.code)
+        verified_phone = verified_phone_from_token(result["id_token"])
+    except FirebaseAuthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except FirebaseOtpError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if verified_phone != payload.phone or result["phone"] != payload.phone:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone verification")
     if payload.phone == current_user.phone:
         raise HTTPException(status_code=400, detail="That is already your phone number")
     existing = db.execute(select(User).where(User.phone == payload.phone)).scalar_one_or_none()
@@ -187,20 +187,6 @@ def change_phone(
     db.refresh(current_user)
     token = encode_token(user_id=current_user.id, phone=current_user.phone)
     return VerifyOtpOut(token=token, user=UserOut.model_validate(current_user))
-
-
-@router.post("/auth/change-phone/request-otp", response_model=RequestOtpOut)
-def request_phone_change_otp(
-    payload: RequestOtpIn,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> RequestOtpOut:
-    """Request a phone-change code without creating a second account row."""
-    if payload.phone == current_user.phone:
-        raise HTTPException(status_code=400, detail="That is already your phone number")
-    if db.execute(select(User.id).where(User.phone == payload.phone)).scalar_one_or_none() is not None:
-        raise HTTPException(status_code=409, detail="Phone number is already in use")
-    return RequestOtpOut(sent=True, debug_otp=MOCK_OTP)
 
 
 @router.post("/auth/upload-image", status_code=status.HTTP_201_CREATED)

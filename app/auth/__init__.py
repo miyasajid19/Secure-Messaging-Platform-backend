@@ -1,4 +1,4 @@
-"""Auth package: mocked-OTP login + JWT + protected routes.
+"""Firebase phone auth, app JWTs, and protected routes.
 
 The router is mounted from `app.main` via `from app.auth.router import
 router`. We deliberately don't re-export it here — re-exporting the

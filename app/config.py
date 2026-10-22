@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     # endpoint. Never expose it through a NEXT_PUBLIC variable.
     imagekit_private_key: str = Field(default="")
 
+    # Firebase Auth REST API credentials for backend-managed SMS verification.
+    firebase_api_key: str = Field(default="")
+    firebase_project_id: str = Field(default="")
+
     # --- CORS -------------------------------------------------------------
     # Comma-separated string in .env, parsed into a list here.
     cors_origins: str = Field(

@@ -1,7 +1,7 @@
 """FastAPI entrypoint.
 
 Phase 0/1/2/4/5/8.4 scope: a /health endpoint that reports row counts,
-an /auth/* router for mocked-OTP login + JWT + protected profile, a
+an /auth/* router for Firebase phone login + app JWT + protected profile, a
 / root for process-up sanity checks, the Phase 4 read-API routers
 (/conversations, /contacts, /users), the Phase 5 realtime stack
 (/ws WebSocket + send/read/message-status REST + /users/online), and

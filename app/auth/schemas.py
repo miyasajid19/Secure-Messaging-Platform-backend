@@ -10,26 +10,22 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-# --- /auth/request-otp ---------------------------------------------------
+# --- /auth/request-otp + /auth/verify-otp -------------------------------
 
 
 class RequestOtpIn(BaseModel):
-    phone: str = Field(min_length=1, description="E.164-style phone number, e.g. +15550000001")
+    phone: str = Field(min_length=3, max_length=16, pattern=r"^\+[1-9]\d{1,14}$")
+    recaptcha_token: str = Field(min_length=1, max_length=8192)
 
 
 class RequestOtpOut(BaseModel):
-    sent: bool
-    # Exposed only because the OTP is mocked. Remove or gate via env
-    # before deploying anywhere real.
-    debug_otp: str
-
-
-# --- /auth/verify-otp ---------------------------------------------------
+    session_info: str
 
 
 class VerifyOtpIn(BaseModel):
-    phone: str = Field(min_length=1)
-    otp: str = Field(min_length=1)
+    phone: str = Field(min_length=3, max_length=16, pattern=r"^\+[1-9]\d{1,14}$")
+    session_info: str = Field(min_length=1, max_length=4096)
+    code: str = Field(pattern=r"^\d{6}$")
 
 
 class UserOut(BaseModel):
@@ -73,4 +69,5 @@ class ProfileUpdateIn(BaseModel):
 
 class ChangePhoneIn(BaseModel):
     phone: str = Field(min_length=3, max_length=32, pattern=r"^\+[1-9]\d{1,14}$")
-    otp: str = Field(min_length=1, max_length=16)
+    session_info: str = Field(min_length=1, max_length=4096)
+    code: str = Field(pattern=r"^\d{6}$")
