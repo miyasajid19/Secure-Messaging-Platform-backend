@@ -39,6 +39,7 @@ from app.models import (
     MessageStatus,
     MessageStatusState,
     User,
+    MessageType,
 )
 from app.realtime import connection_manager
 from app.realtime.events import (
@@ -352,6 +353,11 @@ async def _handle_call_event(sender_id: int, data: dict) -> None:
                 "to_user_id": target_id,
                 **({} if delivered else {"message": "This person is offline"}),
             })
+            if not delivered:
+                await _record_call_system_message(
+                    db, conversation_id, sender_id, participants,
+                    f"Missed {('video' if data.get('media_type') == 'video' else 'voice')} call",
+                )
             return
 
         outgoing_types = {
@@ -374,6 +380,7 @@ async def _handle_call_event(sender_id: int, data: dict) -> None:
             "conversation_id": conversation_id,
             "from_user_id": sender_id,
             "from_name": sender_name,
+            "media_type": "video" if data.get("media_type") == "video" else "audio",
         }
         if event_type in {"call.offer", "call.answer"}:
             description = data.get("description")
@@ -392,6 +399,18 @@ async def _handle_call_event(sender_id: int, data: dict) -> None:
             outgoing["camera_off"] = camera_off
 
         delivered = await connection_manager.send_to_user(target_id, outgoing)
+        if event_type in {"call.reject", "call.cancel", "call.end"}:
+            media_label = "video" if data.get("media_type") == "video" else "voice"
+            if event_type == "call.end":
+                duration = data.get("duration_seconds", 0)
+                if type(duration) is not int or duration < 0:
+                    duration = 0
+                content = f"{media_label.title()} call · {duration // 60}:{duration % 60:02d}"
+            elif event_type == "call.reject":
+                content = f"{'Missed' if data.get('reason') == 'timeout' else 'Declined'} {media_label} call"
+            else:
+                content = f"{'Missed' if data.get('reason') == 'timeout' else 'Cancelled'} {media_label} call"
+            await _record_call_system_message(db, conversation_id, sender_id, participants, content)
         if not delivered and event_type not in {"call.ice"}:
             await connection_manager.send_to_user(sender_id, {
                 "type": "call.peer_offline",
@@ -401,6 +420,62 @@ async def _handle_call_event(sender_id: int, data: dict) -> None:
             })
     finally:
         db.close()
+
+
+async def _record_call_system_message(
+    db,
+    conversation_id: int,
+    sender_id: int,
+    participant_ids: set[int],
+    content: str,
+) -> None:
+    """Persist and broadcast a call activity row in the direct chat."""
+    from app.models import Conversation
+
+    now = datetime.now(timezone.utc)
+    message = Message(
+        conversation_id=conversation_id,
+        sender_id=sender_id,
+        content=content,
+        type=MessageType.SYSTEM,
+        created_at=now,
+    )
+    db.add(message)
+    db.flush()
+    for user_id in participant_ids:
+        db.add(MessageStatus(
+            message_id=message.id,
+            user_id=user_id,
+            status=MessageStatusState.DELIVERED,
+        ))
+    conversation = db.get(Conversation, conversation_id)
+    if conversation is not None:
+        conversation.last_message_at = now
+    db.commit()
+
+    sender = db.get(User, sender_id)
+    if sender is None:
+        return
+    event = {
+        "type": "message.new",
+        "message": MessageOut(
+            id=message.id,
+            conversation_id=conversation_id,
+            sender_id=sender_id,
+            content=content,
+            type=MessageType.SYSTEM.value,
+            created_at=now,
+            parent_id=None,
+            disappear_after_seconds=None,
+            sender=UserOut.model_validate(sender),
+            attachments=[],
+            seen_by=[],
+            parent=None,
+            reactions=[],
+        ).model_dump(mode="json"),
+    }
+    for user_id in participant_ids:
+        await connection_manager.send_to_user(user_id, event)
 
 
 async def _handle_typing_start(sender_id: int, conversation_id: int) -> None:
