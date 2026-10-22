@@ -1,31 +1,36 @@
 """Authenticated stories API. Stories are visible for 24 hours."""
 
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth.deps import get_current_user
+from app.config import get_settings
 from app.database import get_db
-from app.models import Story, StoryView, User
+from app.models import Story, StoryReaction, StoryView, User
 
 router = APIRouter(prefix="/stories", tags=["stories"])
 
 
 class StoryCreate(BaseModel):
     media_url: str | None = Field(default=None, max_length=1024)
+    media_type: Literal["image", "video"] = "image"
     text: str | None = Field(default=None, max_length=500)
     background: str = Field(default="#2563eb", pattern=r"^#[0-9a-fA-F]{6}$")
 
     @model_validator(mode="after")
     def require_content(self):
         if not self.media_url and not (self.text and self.text.strip()):
-            raise ValueError("Add text or an image to your story")
+            raise ValueError("Add text, a photo, or a video to your story")
         if self.media_url and not self.media_url.startswith("https://"):
-            raise ValueError("Story image URL must use HTTPS")
+            raise ValueError("Story media URL must use HTTPS")
+        if self.media_type == "video" and not self.media_url:
+            raise ValueError("A video story needs an uploaded video")
         return self
 
 
@@ -40,17 +45,39 @@ class StoryOut(BaseModel):
     id: int
     user: StoryUser
     media_url: str | None
+    media_type: str
     text: str | None
     background: str
     created_at: datetime
     expires_at: datetime
     viewed_by_me: bool
     view_count: int
+    reaction_counts: dict[str, int]
+    reactions: list["StoryReactionOut"]
+    my_reaction: str | None
+
+
+class StoryReactionOut(BaseModel):
+    user_id: int
+    display_name: str | None
+    username: str | None
+    avatar_url: str | None
+    emoji: str
 
 
 class StoryGroup(BaseModel):
     user: StoryUser
     stories: list[StoryOut]
+
+
+class StoryReactionIn(BaseModel):
+    emoji: str
+
+    @model_validator(mode="after")
+    def validate_emoji(self):
+        if self.emoji not in {"❤️", "😂", "😮", "😢", "🔥", "👍"}:
+            raise ValueError("Choose one of the supported story reactions")
+        return self
 
 
 def _group_stories(db: Session, current_user: User) -> list[StoryGroup]:
@@ -76,6 +103,39 @@ def _group_stories(db: Session, current_user: User) -> list[StoryGroup]:
         )
     ).scalars()) if story_ids else set()
 
+    reaction_counts: dict[int, dict[str, int]] = {}
+    story_reactions: dict[int, list[StoryReactionOut]] = {}
+    if story_ids:
+        for story_id, emoji, count in db.execute(
+            select(StoryReaction.story_id, StoryReaction.emoji, func.count(StoryReaction.id))
+            .where(StoryReaction.story_id.in_(story_ids))
+            .group_by(StoryReaction.story_id, StoryReaction.emoji)
+        ).all():
+            reaction_counts.setdefault(story_id, {})[emoji] = count
+        my_reactions = dict(db.execute(
+            select(StoryReaction.story_id, StoryReaction.emoji).where(
+                StoryReaction.user_id == current_user.id,
+                StoryReaction.story_id.in_(story_ids),
+            )
+        ).all())
+        own_story_ids = [story.id for story, _ in rows if story.user_id == current_user.id]
+        if own_story_ids:
+            for reaction, user in db.execute(
+                select(StoryReaction, User)
+                .join(User, User.id == StoryReaction.user_id)
+                .where(StoryReaction.story_id.in_(own_story_ids))
+                .order_by(StoryReaction.created_at.asc())
+            ).all():
+                story_reactions.setdefault(reaction.story_id, []).append(StoryReactionOut(
+                    user_id=user.id,
+                    display_name=user.display_name,
+                    username=user.username,
+                    avatar_url=user.avatar_url,
+                    emoji=reaction.emoji,
+                ))
+    else:
+        my_reactions = {}
+
     groups: dict[int, tuple[StoryUser, list[StoryOut]]] = {}
     for story, user in rows:
         user_out = StoryUser(id=user.id, display_name=user.display_name, username=user.username, avatar_url=user.avatar_url)
@@ -85,12 +145,16 @@ def _group_stories(db: Session, current_user: User) -> list[StoryGroup]:
             id=story.id,
             user=user_out,
             media_url=story.media_url,
+            media_type=story.media_type,
             text=story.text,
             background=story.background,
             created_at=story.created_at,
             expires_at=story.expires_at,
             viewed_by_me=story.id in viewed,
-            view_count=views.get(story.id, 0),
+            view_count=views.get(story.id, 0) if story.user_id == current_user.id else 0,
+            reaction_counts=reaction_counts.get(story.id, {}) if story.user_id == current_user.id else {},
+            reactions=story_reactions.get(story.id, []),
+            my_reaction=my_reactions.get(story.id),
         ))
     # Put the caller's own story first, then stories not yet viewed.
     ordered = sorted(groups.values(), key=lambda group: (
@@ -112,6 +176,7 @@ def create_story(payload: StoryCreate, current_user: User = Depends(get_current_
     story = Story(
         user_id=current_user.id,
         media_url=payload.media_url,
+        media_type=payload.media_type,
         text=payload.text.strip() if payload.text else None,
         background=payload.background,
         created_at=now,
@@ -124,13 +189,66 @@ def create_story(payload: StoryCreate, current_user: User = Depends(get_current_
         id=story.id,
         user=StoryUser(id=current_user.id, display_name=current_user.display_name, username=current_user.username, avatar_url=current_user.avatar_url),
         media_url=story.media_url,
+        media_type=story.media_type,
         text=story.text,
         background=story.background,
         created_at=story.created_at,
         expires_at=story.expires_at,
         viewed_by_me=False,
         view_count=0,
+        reaction_counts={},
+        reactions=[],
+        my_reaction=None,
     )
+
+
+@router.post("/upload", status_code=status.HTTP_201_CREATED)
+async def upload_story_media(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    """Upload one story photo or video to ImageKit through the backend."""
+    del current_user
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Choose a photo or video")
+    mime = (file.content_type or "application/octet-stream").split(";", 1)[0].lower()
+    is_image = mime.startswith("image/") and mime != "image/svg+xml"
+    is_video = mime in {"video/mp4", "video/webm", "video/quicktime"}
+    if not is_image and not is_video:
+        raise HTTPException(status_code=400, detail="Choose a supported photo or video (MP4, WebM, or MOV)")
+    max_bytes = 50 * 1024 * 1024 if is_video else 5 * 1024 * 1024
+    data = await file.read(max_bytes + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty files cannot be uploaded")
+    if len(data) > max_bytes:
+        limit = "50 MB" if is_video else "5 MB"
+        media_kind = "videos" if is_video else "photos"
+        raise HTTPException(status_code=413, detail=f"Story {media_kind} must be {limit} or smaller")
+
+    private_key = get_settings().imagekit_private_key.strip()
+    if not private_key:
+        raise HTTPException(status_code=503, detail="Image uploads are not configured")
+    import httpx
+
+    filename = file.filename.replace("\\", "/").rsplit("/", 1)[-1].replace("\x00", "")[:180] or "story-media"
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(
+                "https://upload.imagekit.io/api/v1/files/upload",
+                auth=(private_key, ""),
+                data={"fileName": filename, "useUniqueFileName": "true"},
+                files={"file": (filename, data, mime)},
+            )
+            response.raise_for_status()
+            url = response.json().get("url")
+            if not isinstance(url, str) or not url.startswith("https://"):
+                raise ValueError("ImageKit did not return a secure media URL")
+    except (httpx.HTTPError, ValueError) as exc:
+        detail = "Story media upload failed"
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403):
+            detail = "ImageKit rejected the upload credentials"
+        raise HTTPException(status_code=502, detail=detail) from exc
+    return {"url": url, "media_type": "video" if is_video else "image"}
 
 
 @router.post("/{story_id}/view", status_code=status.HTTP_204_NO_CONTENT)
@@ -157,3 +275,41 @@ def delete_story(story_id: int, current_user: User = Depends(get_current_user), 
         raise HTTPException(status_code=403, detail="You can only delete your own stories")
     db.delete(story)
     db.commit()
+
+
+@router.put("/{story_id}/reaction", status_code=status.HTTP_204_NO_CONTENT)
+def react_to_story(
+    story_id: int,
+    payload: StoryReactionIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    story = db.get(Story, story_id)
+    if story is None or story.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=404, detail="Story not found or expired")
+    if story.user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="You can't react to your own story")
+    reaction = db.execute(select(StoryReaction).where(
+        StoryReaction.story_id == story.id,
+        StoryReaction.user_id == current_user.id,
+    )).scalar_one_or_none()
+    if reaction is None:
+        db.add(StoryReaction(story_id=story.id, user_id=current_user.id, emoji=payload.emoji))
+    else:
+        reaction.emoji = payload.emoji
+    db.commit()
+
+
+@router.delete("/{story_id}/reaction", status_code=status.HTTP_204_NO_CONTENT)
+def remove_story_reaction(
+    story_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    reaction = db.execute(select(StoryReaction).where(
+        StoryReaction.story_id == story_id,
+        StoryReaction.user_id == current_user.id,
+    )).scalar_one_or_none()
+    if reaction is not None:
+        db.delete(reaction)
+        db.commit()

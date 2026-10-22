@@ -20,7 +20,7 @@ from app.models.enums import (
 from app.models.message import Message, MessageStatus
 from app.models.reaction import MessageReaction
 from app.models.user import User
-from app.models.story import Story, StoryView
+from app.models.story import Story, StoryReaction, StoryView
 
 __all__ = [
     "Attachment",
@@ -37,4 +37,5 @@ __all__ = [
     "User",
     "Story",
     "StoryView",
+    "StoryReaction",
 ]

@@ -156,6 +156,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # The configured PostgreSQL database is fresh; create_all provisions its
     # current schema without copying data from the former local database.
     Base.metadata.create_all(bind=engine)
+    # `create_all` creates new tables but doesn't alter an existing stories
+    # table. Add the discriminator for existing installations; older rows are
+    # stories of type image by default.
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE stories ADD COLUMN IF NOT EXISTS "
+            "media_type VARCHAR(16) NOT NULL DEFAULT 'image'"
+        ))
 
     # Start the typing-expiry sweeper (one background task per process).
     await connection_manager.start()
@@ -229,6 +237,7 @@ _TABLES_FOR_HEALTH: tuple[str, ...] = (
     "message_reactions",
     "stories",
     "story_views",
+    "story_reactions",
 )
 
 @app.head("/")
