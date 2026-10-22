@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -31,7 +32,9 @@ from sqlalchemy import select
 from app.auth.jwt import decode_token
 from app.database import SessionLocal
 from app.models import (
+    Conversation,
     ConversationParticipant,
+    ConversationType,
     Message,
     MessageStatus,
     MessageStatusState,
@@ -251,6 +254,15 @@ async def websocket_endpoint(
                 log.debug("realtime: bad JSON from user_id=%s", user.id)
                 continue
 
+            if isinstance(data, dict) and isinstance(data.get("type"), str) and data["type"].startswith("call."):
+                if len(raw) <= 128 * 1024:
+                    await _handle_call_event(user.id, data)
+                else:
+                    await connection_manager.send_to_user(user.id, {
+                        "type": "call.error", "message": "Call signaling payload is too large"
+                    })
+                continue
+
             event = parse_client_event(data)
             if event is None:
                 # Unknown type: log and ignore.
@@ -283,6 +295,106 @@ async def websocket_endpoint(
 
 
 # --- Event handlers (DB → broadcast) --------------------------------------
+
+
+async def _handle_call_event(sender_id: int, data: dict) -> None:
+    """Validate direct-chat membership and relay WebRTC call signaling."""
+    event_type = data.get("type")
+    try:
+        call_id = str(uuid.UUID(str(data.get("call_id"))))
+        conversation_id = data.get("conversation_id")
+        target_id = data.get("to_user_id")
+        if type(conversation_id) is not int or type(target_id) is not int:
+            raise ValueError
+        if conversation_id <= 0 or target_id <= 0 or target_id == sender_id:
+            raise ValueError
+    except (ValueError, TypeError, AttributeError):
+        await connection_manager.send_to_user(sender_id, {
+            "type": "call.error", "message": "Invalid call request"
+        })
+        return
+
+    db = _db_session()
+    try:
+        conversation = db.get(Conversation, conversation_id)
+        participants = set(db.execute(
+            select(ConversationParticipant.user_id).where(
+                ConversationParticipant.conversation_id == conversation_id
+            )
+        ).scalars())
+        if (
+            conversation is None
+            or conversation.type != ConversationType.DIRECT
+            or participants != {sender_id, target_id}
+        ):
+            await connection_manager.send_to_user(sender_id, {
+                "type": "call.error", "message": "Calls are only available in a direct conversation"
+            })
+            return
+
+        sender = db.get(User, sender_id)
+        sender_name = sender.display_name or sender.username or "Signal user" if sender else "Signal user"
+
+        if event_type == "call.invite":
+            delivered = await connection_manager.send_to_user(target_id, {
+                "type": "call.incoming",
+                "call_id": call_id,
+                "conversation_id": conversation_id,
+                "from_user_id": sender_id,
+                "from_name": sender_name,
+                "from_avatar_url": sender.avatar_url if sender else None,
+                "media_type": "video" if data.get("media_type") == "video" else "audio",
+            })
+            await connection_manager.send_to_user(sender_id, {
+                "type": "call.ringing" if delivered else "call.unavailable",
+                "call_id": call_id,
+                "conversation_id": conversation_id,
+                "to_user_id": target_id,
+                **({} if delivered else {"message": "This person is offline"}),
+            })
+            return
+
+        outgoing_types = {
+            "call.accept": "call.accepted",
+            "call.reject": "call.rejected",
+            "call.cancel": "call.cancelled",
+            "call.end": "call.ended",
+            "call.offer": "call.offer",
+            "call.answer": "call.answer",
+            "call.ice": "call.ice",
+        }
+        incoming_type = outgoing_types.get(event_type)
+        if incoming_type is None:
+            return
+
+        outgoing = {
+            "type": incoming_type,
+            "call_id": call_id,
+            "conversation_id": conversation_id,
+            "from_user_id": sender_id,
+            "from_name": sender_name,
+        }
+        if event_type in {"call.offer", "call.answer"}:
+            description = data.get("description")
+            if not isinstance(description, dict):
+                return
+            outgoing["description"] = description
+        elif event_type == "call.ice":
+            candidate = data.get("candidate")
+            if candidate is not None and not isinstance(candidate, dict):
+                return
+            outgoing["candidate"] = candidate
+
+        delivered = await connection_manager.send_to_user(target_id, outgoing)
+        if not delivered and event_type not in {"call.ice"}:
+            await connection_manager.send_to_user(sender_id, {
+                "type": "call.peer_offline",
+                "call_id": call_id,
+                "conversation_id": conversation_id,
+                "to_user_id": target_id,
+            })
+    finally:
+        db.close()
 
 
 async def _handle_typing_start(sender_id: int, conversation_id: int) -> None:

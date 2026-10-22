@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     firebase_api_key: str = Field(default="")
     firebase_project_id: str = Field(default="")
 
+    # Optional TURN REST credentials. Configure coturn (or another TURN
+    # provider) with the same shared secret for calls across restrictive NATs.
+    turn_urls: str = Field(default="")
+    turn_shared_secret: str = Field(default="")
+    turn_credential_ttl_seconds: int = Field(default=3600, ge=300, le=86400)
+
     # --- CORS -------------------------------------------------------------
     # Comma-separated string in .env, parsed into a list here.
     cors_origins: str = Field(
