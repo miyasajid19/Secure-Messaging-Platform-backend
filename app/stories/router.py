@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.auth.deps import get_current_user
 from app.config import get_settings
 from app.database import get_db
-from app.models import Story, StoryReaction, StoryView, User
+from app.models import Contact, Conversation, ConversationParticipant, ConversationType, Story, StoryReaction, StoryView, User
 
 router = APIRouter(prefix="/stories", tags=["stories"])
 
@@ -32,6 +32,10 @@ class StoryCreate(BaseModel):
         if self.media_type == "video" and not self.media_url:
             raise ValueError("A video story needs an uploaded video")
         return self
+
+
+class StoryBatchCreate(BaseModel):
+    stories: list[StoryCreate] = Field(min_length=1, max_length=10)
 
 
 class StoryUser(BaseModel):
@@ -54,6 +58,7 @@ class StoryOut(BaseModel):
     view_count: int
     reaction_counts: dict[str, int]
     reactions: list["StoryReactionOut"]
+    viewers: list["StoryViewerOut"]
     my_reaction: str | None
 
 
@@ -63,6 +68,14 @@ class StoryReactionOut(BaseModel):
     username: str | None
     avatar_url: str | None
     emoji: str
+
+
+class StoryViewerOut(BaseModel):
+    user_id: int
+    display_name: str | None
+    username: str | None
+    avatar_url: str | None
+    viewed_at: datetime
 
 
 class StoryGroup(BaseModel):
@@ -80,13 +93,49 @@ class StoryReactionIn(BaseModel):
         return self
 
 
+def _mutual_contact_ids(db: Session, user_id: int) -> set[int]:
+    """Return users who have mutually added each other as a contact."""
+    my_contacts = set(db.execute(
+        select(Contact.contact_id).where(Contact.owner_id == user_id)
+    ).scalars())
+    if not my_contacts:
+        return set()
+    contacts_who_added_me = set(db.execute(
+        select(Contact.owner_id).where(Contact.contact_id == user_id)
+    ).scalars())
+    return my_contacts & contacts_who_added_me
+
+
+def _story_audience_ids(db: Session, user_id: int) -> set[int]:
+    """Friends are mutual contacts or participants in an existing direct chat."""
+    direct_peers = set(db.execute(
+        select(ConversationParticipant.user_id)
+        .join(Conversation, Conversation.id == ConversationParticipant.conversation_id)
+        .where(
+            Conversation.type == ConversationType.DIRECT,
+            ConversationParticipant.conversation_id.in_(
+                select(ConversationParticipant.conversation_id).where(
+                    ConversationParticipant.user_id == user_id
+                )
+            ),
+            ConversationParticipant.user_id != user_id,
+        )
+    ).scalars())
+    return _mutual_contact_ids(db, user_id) | direct_peers
+
+
+def _can_view_story(db: Session, story: Story, user_id: int) -> bool:
+    return story.user_id == user_id or story.user_id in _story_audience_ids(db, user_id)
+
+
 def _group_stories(db: Session, current_user: User) -> list[StoryGroup]:
     now = datetime.now(timezone.utc)
+    visible_user_ids = _story_audience_ids(db, current_user.id) | {current_user.id}
     rows = db.execute(
         select(Story, User)
         .join(User, User.id == Story.user_id)
-        .where(Story.expires_at > now)
-        .order_by(Story.created_at.asc())
+        .where(Story.expires_at > now, Story.user_id.in_(visible_user_ids))
+        .order_by(Story.created_at.asc(), Story.id.asc())
     ).all()
     story_ids = [story.id for story, _ in rows]
     views = {}
@@ -105,6 +154,7 @@ def _group_stories(db: Session, current_user: User) -> list[StoryGroup]:
 
     reaction_counts: dict[int, dict[str, int]] = {}
     story_reactions: dict[int, list[StoryReactionOut]] = {}
+    story_viewers: dict[int, list[StoryViewerOut]] = {}
     if story_ids:
         for story_id, emoji, count in db.execute(
             select(StoryReaction.story_id, StoryReaction.emoji, func.count(StoryReaction.id))
@@ -133,6 +183,19 @@ def _group_stories(db: Session, current_user: User) -> list[StoryGroup]:
                     avatar_url=user.avatar_url,
                     emoji=reaction.emoji,
                 ))
+            for view, user in db.execute(
+                select(StoryView, User)
+                .join(User, User.id == StoryView.user_id)
+                .where(StoryView.story_id.in_(own_story_ids))
+                .order_by(StoryView.viewed_at.desc())
+            ).all():
+                story_viewers.setdefault(view.story_id, []).append(StoryViewerOut(
+                    user_id=user.id,
+                    display_name=user.display_name,
+                    username=user.username,
+                    avatar_url=user.avatar_url,
+                    viewed_at=view.viewed_at,
+                ))
     else:
         my_reactions = {}
 
@@ -154,6 +217,7 @@ def _group_stories(db: Session, current_user: User) -> list[StoryGroup]:
             view_count=views.get(story.id, 0) if story.user_id == current_user.id else 0,
             reaction_counts=reaction_counts.get(story.id, {}) if story.user_id == current_user.id else {},
             reactions=story_reactions.get(story.id, []),
+            viewers=story_viewers.get(story.id, []),
             my_reaction=my_reactions.get(story.id),
         ))
     # Put the caller's own story first, then stories not yet viewed.
@@ -198,8 +262,46 @@ def create_story(payload: StoryCreate, current_user: User = Depends(get_current_
         view_count=0,
         reaction_counts={},
         reactions=[],
+        viewers=[],
         my_reaction=None,
     )
+
+
+@router.post("/batch", response_model=list[StoryOut], status_code=status.HTTP_201_CREATED)
+def create_stories_batch(
+    payload: StoryBatchCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create up to ten story items together with a single database commit."""
+    now = datetime.now(timezone.utc)
+    stories = [Story(
+        user_id=current_user.id,
+        media_url=item.media_url,
+        media_type=item.media_type,
+        text=item.text.strip() if item.text else None,
+        background=item.background,
+        created_at=now,
+        expires_at=now + timedelta(hours=24),
+    ) for item in payload.stories]
+    db.add_all(stories)
+    db.commit()
+    return [StoryOut(
+        id=story.id,
+        user=StoryUser(id=current_user.id, display_name=current_user.display_name, username=current_user.username, avatar_url=current_user.avatar_url),
+        media_url=story.media_url,
+        media_type=story.media_type,
+        text=story.text,
+        background=story.background,
+        created_at=story.created_at,
+        expires_at=story.expires_at,
+        viewed_by_me=False,
+        view_count=0,
+        reaction_counts={},
+        reactions=[],
+        viewers=[],
+        my_reaction=None,
+    ) for story in stories]
 
 
 @router.post("/upload", status_code=status.HTTP_201_CREATED)
@@ -257,6 +359,8 @@ def view_story(story_id: int, current_user: User = Depends(get_current_user), db
     now = datetime.now(timezone.utc)
     if story is None or story.expires_at <= now:
         raise HTTPException(status_code=404, detail="Story not found or expired")
+    if not _can_view_story(db, story, current_user.id):
+        raise HTTPException(status_code=404, detail="Story not found")
     if story.user_id == current_user.id:
         return
     db.add(StoryView(story_id=story.id, user_id=current_user.id))
@@ -287,6 +391,8 @@ def react_to_story(
     story = db.get(Story, story_id)
     if story is None or story.expires_at <= datetime.now(timezone.utc):
         raise HTTPException(status_code=404, detail="Story not found or expired")
+    if not _can_view_story(db, story, current_user.id):
+        raise HTTPException(status_code=404, detail="Story not found")
     if story.user_id == current_user.id:
         raise HTTPException(status_code=400, detail="You can't react to your own story")
     reaction = db.execute(select(StoryReaction).where(
