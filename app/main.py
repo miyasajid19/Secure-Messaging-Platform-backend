@@ -33,6 +33,7 @@ from app.models import ConversationParticipant
 from app.realtime import connection_manager
 from app.realtime.router import router as realtime_router
 from app.users.router import router as users_router
+from app.stories.router import router as stories_router
 from sqlalchemy import select
 
 log = logging.getLogger("main")
@@ -69,6 +70,9 @@ async def _sweep_disappearing_once() -> int:
             )
         )
         deleted = result.fetchall()
+        # Expired stories are excluded from API reads immediately; this sweep
+        # also removes their rows and cascades their view receipts.
+        conn.execute(text("DELETE FROM stories WHERE expires_at <= CURRENT_TIMESTAMP"))
         conn.commit()
 
     if not deleted:
@@ -194,6 +198,7 @@ app.include_router(auth_router)
 app.include_router(conversations_router)
 app.include_router(contacts_router)
 app.include_router(users_router)
+app.include_router(stories_router)
 app.include_router(realtime_router)
 
 
@@ -222,6 +227,8 @@ _TABLES_FOR_HEALTH: tuple[str, ...] = (
     "message_status",
     "attachments",
     "message_reactions",
+    "stories",
+    "story_views",
 )
 
 @app.head("/")
