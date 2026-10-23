@@ -11,8 +11,8 @@ from datetime import datetime, timezone
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -33,7 +33,14 @@ router = APIRouter(tags=["contacts"])
 
 
 class AddContactIn(BaseModel):
-    phone: str = Field(min_length=1, description="E.164 phone, e.g. +15550000001")
+    phone: str | None = Field(default=None, min_length=3, max_length=16, pattern=r"^\+[1-9]\d{1,14}$")
+    email: str | None = Field(default=None, min_length=6, max_length=254, pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+    @model_validator(mode="after")
+    def exactly_one_destination(self):
+        if (self.phone is None) == (self.email is None):
+            raise ValueError("Provide exactly one of phone or email")
+        return self
 
 
 # --- helpers --------------------------------------------------------------
@@ -139,7 +146,7 @@ def add_contact(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ConversationOut:
-    """Add a contact by phone, guaranteeing a direct conversation exists.
+    """Add a contact by verified phone or email, guaranteeing a direct chat.
 
     Status codes:
       - 404: target user not found (we don't auto-create here; that's
@@ -147,9 +154,10 @@ def add_contact(
       - 409: target is already a contact.
       - 200: contact created, conversation (new or existing) returned.
     """
-    target = db.execute(
-        select(User).where(User.phone == payload.phone)
-    ).scalar_one_or_none()
+    target = db.execute(select(User).where(or_(
+        User.phone == payload.phone if payload.phone is not None else False,
+        User.email == payload.email.strip().lower() if payload.email is not None else False,
+    ))).scalar_one_or_none()
     if target is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

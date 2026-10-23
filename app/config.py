@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     firebase_api_key: str = Field(default="")
     firebase_project_id: str = Field(default="")
 
+    firebase_email_continue_url: str = Field(default="http://localhost:3000/auth/email-link")
+
     # Optional TURN REST credentials. Configure coturn (or another TURN
     # provider) with the same shared secret for calls across restrictive NATs.
     turn_urls: str = Field(default="")

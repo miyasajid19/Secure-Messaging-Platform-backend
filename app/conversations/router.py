@@ -117,7 +117,7 @@ def _parent_preview(db: Session, m: Message) -> Optional["MessageParent"]:
     if parent is None:
         return None
     sender = db.get(User, parent.sender_id)
-    sender_name = sender.display_name if sender and sender.display_name else (sender.phone if sender else None)
+    sender_name = (sender.display_name or sender.phone or sender.email) if sender else None
 
     # Image and system messages don't have a useful text preview.
     if parent.type == MessageType.IMAGE:
@@ -171,7 +171,7 @@ def _parents_for(db: Session, messages: list[Message]) -> dict[int, "MessagePare
         sender_name = (
             sender.display_name
             if sender and sender.display_name
-            else (sender.phone if sender else None)
+            else ((sender.phone or sender.email) if sender else None)
         )
         if parent.type == MessageType.IMAGE:
             content = _PARENT_IMAGE_SENTINEL
@@ -1149,7 +1149,7 @@ async def add_member(
         db,
         conversation_id=conversation_id,
         sender_id=current_user.id,
-        content=target.display_name or target.phone,
+        content=target.display_name or target.phone or target.email or "Signal user",
         participant_ids=participant_ids,
     )
     db.commit()
@@ -1284,7 +1284,7 @@ async def _remove_group_participant(
     # The frontend renders "X left the group." vs "Y removed X." based
     # on whether the sender is the same as the subject.
     target = db.get(User, user_id)
-    sys_content = (target.display_name or target.phone) if target else "user"
+    sys_content = (target.display_name or target.phone or target.email) if target else "user"
     actor_id = user_id if user_id == actor.id else actor.id
     sys_msg = _emit_system_message(
         db,

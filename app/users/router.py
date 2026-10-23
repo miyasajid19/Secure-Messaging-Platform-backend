@@ -36,7 +36,7 @@ func_lower = func.lower
 
 @router.get("/users/search", response_model=List[UserSearchResult])
 def search_users(
-    q: str = Query(default="", description="Search by phone prefix, display_name, or username"),
+    q: str = Query(default="", description="Search by phone, email, display name, or username"),
     conversation_id: Optional[int] = Query(
         default=None,
         ge=1,
@@ -72,6 +72,7 @@ def search_users(
             .where(
                 or_(
                     User.phone.like(phone_prefix),
+                    func_lower(User.email).like(like),
                     func_lower(User.display_name).like(like),
                     func_lower(User.username).like(like),
                 )
@@ -110,6 +111,7 @@ def search_users(
         UserSearchResult(
             id=u.id,
             phone=u.phone,
+            email=u.email,
             display_name=u.display_name,
             avatar_url=u.avatar_url,
             already_contact=u.id in already_contacts,

@@ -235,7 +235,7 @@ async def websocket_endpoint(
                     if participant:
                         participant_info.append({
                             "id": participant.id,
-                            "display_name": participant.display_name or participant.username or participant.phone,
+                            "display_name": participant.display_name or participant.username or participant.phone or participant.email or "Signal user",
                             "avatar_url": participant.avatar_url,
                         })
                 await ws.send_json({
@@ -521,7 +521,7 @@ async def _handle_group_call_event(
     sender = db.get(User, sender_id)
     if sender is None:
         return
-    sender_name = sender.display_name or sender.username or sender.phone
+    sender_name = sender.display_name or sender.username or sender.phone or sender.email or "Signal user"
 
     if event_type == "call.invite":
         recipients = data.get("to_user_ids")
@@ -644,7 +644,7 @@ async def _handle_group_call_event(
             if user:
                 participant_info.append({
                     "id": user.id,
-                    "display_name": user.display_name or user.username or user.phone,
+                    "display_name": user.display_name or user.username or user.phone or user.email or "Signal user",
                     "avatar_url": user.avatar_url,
                 })
         joined_event = {
@@ -725,7 +725,7 @@ async def _handle_group_call_event(
                 "from_user_id": sender_id,
                 "participants": [
                     {"id": (user := db.get(User, user_id)).id,
-                     "display_name": user.display_name or user.username or user.phone,
+                     "display_name": user.display_name or user.username or user.phone or user.email or "Signal user",
                      "avatar_url": user.avatar_url}
                     for user_id in session.participant_ids if (user := db.get(User, user_id))
                 ],
@@ -739,7 +739,7 @@ async def _handle_group_call_event(
                 if participant:
                     participant_info.append({
                         "id": participant.id,
-                        "display_name": participant.display_name or participant.username or participant.phone,
+                        "display_name": participant.display_name or participant.username or participant.phone or participant.email or "Signal user",
                         "avatar_url": participant.avatar_url,
                     })
             state_event = {

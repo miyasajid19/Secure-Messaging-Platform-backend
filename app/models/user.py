@@ -1,6 +1,6 @@
 """User account table.
 
-`phone` is the auth identifier (Phase 2 will key JWT issuance off it).
+Exactly one verified contact identifier (`phone` or `email`) is used to sign in.
 `username` is optional and display-only — set later when a user picks one.
 `password_hash` is nullable until Phase 2 lands.
 """
@@ -30,7 +30,8 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    phone: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
+    phone: Mapped[Optional[str]] = mapped_column(String(32), unique=True, index=True, nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(String(254), unique=True, index=True, nullable=True)
     username: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True, nullable=True)
     display_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     avatar_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)

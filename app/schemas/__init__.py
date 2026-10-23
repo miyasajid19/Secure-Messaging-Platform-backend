@@ -181,7 +181,8 @@ class UserSearchResult(BaseModel):
     """
 
     id: int
-    phone: str
+    phone: Optional[str] = None
+    email: Optional[str] = None
     display_name: Optional[str] = None
     avatar_url: Optional[str] = None
     already_contact: bool = False

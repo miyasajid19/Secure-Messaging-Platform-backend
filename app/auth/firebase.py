@@ -1,4 +1,4 @@
-"""Verify Firebase Authentication ID tokens issued after phone sign-in."""
+"""Verify Firebase Authentication ID tokens issued after phone or email sign-in."""
 
 from __future__ import annotations
 
@@ -19,8 +19,7 @@ class FirebaseAuthUnavailable(Exception):
     """Firebase project configuration or signing keys are unavailable."""
 
 
-def verified_phone_from_token(id_token: str) -> str | None:
-    """Return the verified E.164 phone from a valid Firebase ID token."""
+def _verified_claims(id_token: str) -> dict | None:
     project_id = get_settings().firebase_project_id.strip()
     if not project_id:
         raise FirebaseAuthUnavailable("Firebase project is not configured on the backend")
@@ -40,6 +39,14 @@ def verified_phone_from_token(id_token: str) -> str | None:
     except PyJWTError:
         return None
 
+    return claims
+
+
+def verified_phone_from_token(id_token: str) -> str | None:
+    """Return the verified E.164 phone from a valid Firebase ID token."""
+    claims = _verified_claims(id_token)
+    if claims is None:
+        return None
     phone = claims.get("phone_number")
     firebase_claims = claims.get("firebase")
     if (
@@ -49,3 +56,14 @@ def verified_phone_from_token(id_token: str) -> str | None:
     ):
         return None
     return phone
+
+
+def verified_email_from_token(id_token: str) -> str | None:
+    """Return a Firebase-verified email from a valid Firebase ID token."""
+    claims = _verified_claims(id_token)
+    if claims is None:
+        return None
+    email = claims.get("email")
+    if not isinstance(email, str) or claims.get("email_verified") is not True:
+        return None
+    return email.strip().lower()

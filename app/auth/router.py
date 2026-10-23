@@ -23,7 +23,8 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.auth.deps import get_current_user
-from app.auth.firebase import FirebaseAuthUnavailable, verified_phone_from_token
+from app.auth.firebase import FirebaseAuthUnavailable, verified_email_from_token, verified_phone_from_token
+from app.auth.firebase_email_link import request_email_sign_in_link
 from app.auth.firebase_otp import FirebaseOtpError, request_phone_code, verify_phone_code
 from app.auth.jwt import encode_token
 from app.auth.schemas import (
@@ -67,39 +68,68 @@ def _get_or_create_user_by_phone(db: Session, phone: str) -> User:
     return user
 
 
+def _get_or_create_user_by_email(db: Session, email: str) -> User:
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    if user is not None:
+        return user
+    user = User(email=email)
+    db.add(user)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        user = db.execute(select(User).where(User.email == email)).scalar_one()
+    return user
+
+
 # --- /auth/request-otp + /auth/verify-otp -------------------------------
 
 
 @router.post("/auth/request-otp", response_model=RequestOtpOut)
 async def request_otp(payload: RequestOtpIn) -> RequestOtpOut:
-    """Ask Firebase to send a real SMS; the browser supplies reCAPTCHA proof."""
+    """Ask Firebase to send an SMS code or a passwordless email link."""
+    if payload.phone is not None:
+        try:
+            session_info = await request_phone_code(payload.phone, payload.recaptcha_token or "")
+        except FirebaseOtpError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return RequestOtpOut(channel="phone", session_info=session_info)
+
+    email = (payload.email or "").strip().lower()
     try:
-        session_info = await request_phone_code(payload.phone, payload.recaptcha_token)
+        await request_email_sign_in_link(email)
     except FirebaseOtpError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return RequestOtpOut(session_info=session_info)
+    return RequestOtpOut(channel="email")
 
 
 @router.post("/auth/verify-otp", response_model=VerifyOtpOut)
 async def verify_otp(payload: VerifyOtpIn, db: Session = Depends(get_db)) -> VerifyOtpOut:
-    """Ask Firebase to validate the SMS code, then issue the app JWT."""
-    try:
-        result = await verify_phone_code(payload.session_info, payload.code)
-        verified_phone = verified_phone_from_token(result["id_token"])
-    except FirebaseAuthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except FirebaseOtpError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    if verified_phone != payload.phone or result["phone"] != payload.phone:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Firebase token does not verify this phone number",
-        )
+    """Verify a Firebase SMS code or Firebase email-link ID token."""
+    if payload.phone is not None:
+        try:
+            result = await verify_phone_code(payload.session_info or "", payload.code or "")
+            verified_phone = verified_phone_from_token(result["id_token"])
+        except FirebaseAuthUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except FirebaseOtpError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        if verified_phone != payload.phone or result["phone"] != payload.phone:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Firebase token does not verify this phone number")
+        user = _get_or_create_user_by_phone(db, payload.phone)
+    else:
+        email = (payload.email or "").strip().lower()
+        try:
+            verified_email = verified_email_from_token(payload.firebase_id_token or "")
+        except FirebaseAuthUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if verified_email != email:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Firebase token does not verify this email address")
+        user = _get_or_create_user_by_email(db, email)
 
-    user = _get_or_create_user_by_phone(db, payload.phone)
     db.commit()
 
-    token = encode_token(user_id=user.id, phone=user.phone)
+    token = encode_token(user_id=user.id, phone=user.phone, email=user.email)
     return VerifyOtpOut(token=token, user=UserOut.model_validate(user))
 
 
@@ -185,7 +215,7 @@ async def change_phone(
         db.rollback()
         raise HTTPException(status_code=409, detail="Phone number is already in use") from exc
     db.refresh(current_user)
-    token = encode_token(user_id=current_user.id, phone=current_user.phone)
+    token = encode_token(user_id=current_user.id, phone=current_user.phone, email=current_user.email)
     return VerifyOtpOut(token=token, user=UserOut.model_validate(current_user))
 
 

@@ -14,12 +14,12 @@ import jwt as pyjwt
 from app.config import get_settings
 
 
-def encode_token(*, user_id: int, phone: str) -> str:
+def encode_token(*, user_id: int, phone: str | None = None, email: str | None = None) -> str:
     """Issue a signed JWT for the given user.
 
     Payload keys:
       - `sub`: user id (string per RFC 7519)
-      - `phone`: convenience for the frontend / WS handshake
+      - `phone` and `email`: verified account identifiers, either may be null
       - `iat`, `exp`: timestamps in seconds
       - `iss`: settings.jwt_issuer (lets the verifier reject tokens that
         were issued by a different service)
@@ -29,6 +29,7 @@ def encode_token(*, user_id: int, phone: str) -> str:
     payload: dict[str, Any] = {
         "sub": str(user_id),
         "phone": phone,
+        "email": email,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=settings.jwt_expires_minutes)).timestamp()),
         "iss": settings.jwt_issuer,

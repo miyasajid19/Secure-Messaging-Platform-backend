@@ -92,15 +92,16 @@ Demo data is opt-in: run `python -m app.seed` manually only when you want sample
 | `IMAGEKIT_PRIVATE_KEY` | only for attachments | `<key>` | ImageKit server-side upload key for chat attachments. Optional — composer hides the paperclip if missing. |
 | `FIREBASE_API_KEY` | yes for phone auth | `<web-api-key>` | Used server-side to call Firebase's phone verification REST API. |
 | `FIREBASE_PROJECT_ID` | yes for phone auth | `<project-id>` | Must match the Firebase project used by the frontend. |
+| `FIREBASE_EMAIL_CONTINUE_URL` | yes for email sign-in | `https://your-app.example/auth/email-link` | Frontend callback URL Firebase redirects to after sending the sign-in link. Its host must be authorized in Firebase Authentication. |
 
 
 ## Database schema
 
-8 tables; all FK columns indexed; `ON DELETE CASCADE` on the dependent rows so a delete of a `conversation` or `user` cleans up cleanly.
+Tables use indexed foreign keys and `ON DELETE CASCADE` on dependent rows.
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `users` | `id, phone (unique), username, display_name, avatar_url, password_hash (unused), last_seen, created_at` | Created after Firebase verifies the phone during login. |
+| `users` | `id, phone (unique, nullable), email (unique, nullable), username, display_name, avatar_url, password_hash (unused), last_seen, created_at` | Created after phone or email verification. |
 | `contacts` | `owner_id, contact_id, nickname, added_at` | UNIQUE on `(owner_id, contact_id)`. |
 | `conversations` | `id, type ('direct'\|'group'), name, disappear_after_seconds, last_message_at, created_at` | `last_message_at` indexed for the list query. |
 | `conversation_participants` | `conversation_id, user_id, joined_at, role ('admin'\|'member')` | UNIQUE on `(conversation_id, user_id)`. |
@@ -124,7 +125,13 @@ All settings live in `app/config.py` (`pydantic-settings.BaseSettings`) and load
 | `JWT_EXPIRES_MINUTES` | `10080` | 7 days. |
 | `JWT_ISSUER` | `signal-clone` | Tokens with a different `iss` are rejected. |
 | `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated. Each value is added to CORS `allow_origins`. |
+| `FIREBASE_API_KEY` | (empty) | Firebase Auth REST API key used by backend phone and email verification requests. |
+| `FIREBASE_PROJECT_ID` | (empty) | Firebase project ID used to verify ID tokens. |
+| `FIREBASE_EMAIL_CONTINUE_URL` | `http://localhost:3000/auth/email-link` | Frontend callback Firebase redirects to for email-link sign-in; add its domain to Firebase authorized domains. |
 | `IMAGEKIT_PRIVATE_KEY` | (empty) | ImageKit server-side upload key for chat attachments. Optional. |
+| `TURN_URLS` | (empty) | Optional comma-separated TURN URLs (for example `turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349?transport=tcp`). TURN relay is needed when peers cannot connect directly across NATs/firewalls. |
+| `TURN_SHARED_SECRET` | (empty) | Shared secret for TURN REST credentials. Must match the coturn/provider secret; keep it backend-only. |
+| `TURN_CREDENTIAL_TTL_SECONDS` | `3600` | Lifetime of the short-lived TURN credentials returned by `GET /calls/ice-servers` (300–86400). |
 
 ## API reference
 
@@ -133,8 +140,8 @@ All routes below require `Authorization: Bearer <token>` (the JWT issued by `/au
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET` | `/health` | — | Row counts per table (smoke check). |
-| `POST` | `/auth/request-otp` | — | Send Firebase SMS after validating browser reCAPTCHA proof. Body: `{phone, recaptcha_token}`; returns `{session_info}`. |
-| `POST` | `/auth/verify-otp` | — | Verify the submitted OTP with Firebase, then issue app JWT. Body: `{phone, session_info, code}`. |
+| `POST` | `/auth/request-otp` | — | Ask Firebase to send phone SMS or an email sign-in link. Body: `{phone, recaptcha_token}` or `{email}`. |
+| `POST` | `/auth/verify-otp` | — | Verify phone code or a Firebase email-link ID token, then issue app JWT. |
 | `GET` | `/auth/me` | ✅ | Current user. |
 | `PATCH` | `/auth/profile` | ✅ | Update display_name / username / avatar_url. Bumps `last_seen`. |
 | `POST` | `/auth/change-phone` | ✅ | Verify `{phone, session_info, code}` with Firebase and return updated user plus replacement JWT. |
@@ -156,20 +163,28 @@ All routes below require `Authorization: Bearer <token>` (the JWT issued by `/au
 | `PATCH` | `/conversations/{id}/members/{user_id}` | ✅ | Admin-only. Change role. |
 | `DELETE` | `/conversations/{id}` | ✅ | Admin-only. Cascade-delete the group. |
 | `GET` | `/contacts` | ✅ | Current user's contacts, newest first. |
-| `POST` | `/contacts` | ✅ | Add a contact by phone. Auto-creates a direct conversation. |
-| `GET` | `/users/search?q=<query>` | ✅ | Search users by phone/display_name/username. Optional `?conversation_id=` to set `already_member`. |
+| `POST` | `/contacts` | ✅ | Add a contact by verified phone or email. Auto-creates a direct conversation. |
+| `GET` | `/users/search?q=<query>` | ✅ | Search users by phone/email/display_name/username. Optional `?conversation_id=` to set `already_member`. |
 | `GET` | `/users/online` | ✅ | List of currently-connected user ids. |
 | `POST` | `/messages/{id}/reactions` | ✅ | Add an emoji reaction. Body `{emoji}`. 201 + `ReactionGroup`. |
 | `DELETE` | `/messages/{id}/reactions/{emoji}` | ✅ | Remove a reaction. 204 on success. |
 | `WS` | `/ws?token=<jwt>` | ✅ (query) | Single bidirectional channel for `message.new`, `message.read.bulk`, `reactions.update`, `typing`, `presence`, `presence.snapshot`, `conversation.updated`, `conversation.deleted`, `message.delete`. |
 
-## Auth (Firebase Phone Authentication)
+## Auth (Phone OTP and Firebase Email Links)
 
-The frontend obtains Firebase's required browser reCAPTCHA proof, then asks the backend to request the SMS through Firebase. The backend returns an opaque Firebase `session_info`; the frontend submits that and the code to `/auth/verify-otp`, where the backend asks Firebase to validate it before issuing the app JWT. The backend also validates the Firebase ID token returned by Firebase and requires its verified phone claim to match the submitted E.164 number. `/auth/change-phone` uses the same backend verification flow for the replacement number.
+The same sign-in screen lets a user choose phone or email. For phone, the browser supplies Firebase's required reCAPTCHA proof and the backend asks Firebase to send and validate SMS OTPs. For email, the backend asks Firebase Authentication to send a passwordless email sign-in link. The browser completes that Firebase link and sends the resulting Firebase ID token to `POST /auth/verify-otp`; the backend verifies the token, checks its verified email, and issues the app JWT. The same email address must be entered when completing a link opened on another device.
 
 Set `FIREBASE_API_KEY` and `FIREBASE_PROJECT_ID` in the backend environment. Set the Firebase web app values as `NEXT_PUBLIC_FIREBASE_*` in the frontend environment (`frontend/.env.local` locally and the frontend host environment in production). These web config values are public; do not put service-account private keys in frontend variables. Enable Phone sign-in and configure SMS region policy in Firebase Console, and authorize the app's domains. Firebase test phone numbers can be set up in Firebase Console for development; the app no longer accepts the fixed `123456` mock code.
 
-Both frontend and backend validate E.164 phone format, and the backend checks that the Firebase verified phone exactly matches the submitted number.
+For email login, enable **Email/Password** and **Email link (passwordless sign-in)** in Firebase Authentication. Set backend `FIREBASE_EMAIL_CONTINUE_URL` to the frontend callback URL (`http://localhost:3000/auth/email-link` locally, and your HTTPS frontend URL in production), and add its host to Firebase Authentication authorized domains. Firebase sends the link; no SMTP credentials or Firebase account for the end user are needed.
+
+The user table has a nullable unique `email` column and nullable `phone`. When intentionally resetting a development database, run `python -m app.reset_database --yes` from `backend/`; this drops and recreates every application table and deletes all app data. This command is never run during server startup.
+
+## Audio/video calls
+
+Calls use WebRTC peer connections with public STUN servers by default. For reliable group calls across restrictive NATs, configure a TURN service and set `TURN_URLS` plus `TURN_SHARED_SECRET` on the backend. The backend returns expiring HMAC credentials from `GET /calls/ice-servers`; the frontend fetches those credentials before each peer connection. Do not expose the shared secret in frontend environment variables. Test calls from separate networks and devices, since localhost testing does not exercise TURN relay behavior.
+
+Phone entry uses E.164 validation, and the backend checks Firebase's verified phone exactly matches the submitted number. Email format is validated by the backend before requesting the Firebase link, and the backend accepts email sign-in only when the ID token has a verified email matching the requested address.
 
 ```bash
 # After Firebase has completed SMS verification, exchange its ID token for

@@ -43,7 +43,7 @@ def get_call_history(
             "call_id": row.call_id,
             "conversation_id": row.conversation_id,
             "peer_id": peer.id,
-            "peer_name": peer.display_name or peer.username or peer.phone,
+            "peer_name": peer.display_name or peer.username or peer.phone or peer.email or "Signal user",
             "peer_avatar_url": peer.avatar_url,
             "media_type": row.media_type,
             "direction": "outgoing" if row.caller_id == current_user.id else "incoming",
