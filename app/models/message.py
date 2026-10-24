@@ -12,7 +12,7 @@ in his outbox view) for Carol until she opens it.
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, Index, Integer, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Enum as SAEnum, ForeignKey, Index, Integer, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -73,6 +73,7 @@ class Message(Base):
     deleted_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    forwarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
 class MessageStatus(Base):

@@ -177,6 +177,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS "
             "deleted_at TIMESTAMPTZ"
         ))
+        conn.execute(text(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS "
+            "forwarded BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
 
     # Start the typing-expiry sweeper (one background task per process).
     await connection_manager.start()

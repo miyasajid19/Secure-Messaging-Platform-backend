@@ -209,6 +209,7 @@ def to_conversation_out(
             update={
                 "content": "Message deleted" if last_msg.deleted_at else last_msg.content,
                 "is_deleted": last_msg.deleted_at is not None,
+                "forwarded": last_msg.forwarded,
             }
         )
 

@@ -98,6 +98,7 @@ def _messages_out(db: Session, msgs: list[Message]) -> list[MessageOut]:
             type=message.type.value,
             created_at=message.created_at,
             is_deleted=message.deleted_at is not None,
+            forwarded=message.forwarded,
             edited_at=None if message.deleted_at else edit_info.get(message.id, (None, None))[0],
             previous_content=None if message.deleted_at else edit_info.get(message.id, (None, None))[1],
             parent_id=message.parent_id,
@@ -611,6 +612,7 @@ def _build_message_out(db: Session, m: Message) -> MessageOut:
         type=m.type.value,
         created_at=m.created_at,
         is_deleted=m.deleted_at is not None,
+        forwarded=m.forwarded,
         edited_at=edit_info.edited_at if edit_info and not m.deleted_at else None,
         previous_content=edit_info.previous_content if edit_info and not m.deleted_at else None,
         parent_id=m.parent_id,
@@ -780,6 +782,110 @@ class EditMessageIn(BaseModel):
         if not self.content.strip():
             raise ValueError("message text cannot be blank")
         return self
+
+
+class ForwardMessageIn(BaseModel):
+    conversation_ids: list[int] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def require_unique_destinations(self):
+        if len(set(self.conversation_ids)) != len(self.conversation_ids):
+            raise ValueError("destination conversations must be unique")
+        return self
+
+
+@router.post("/messages/{message_id}/forward", response_model=list[MessageOut], status_code=status.HTTP_201_CREATED)
+async def forward_message(
+    message_id: int,
+    payload: ForwardMessageIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[MessageOut]:
+    """Copy a message to selected chats without a reply/reference link."""
+    source = db.get(Message, message_id)
+    if source is None or source.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="message not found")
+    if not service.user_is_participant(db, source.conversation_id, current_user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
+    if source.type == MessageType.SYSTEM:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="system messages cannot be forwarded")
+
+    source_attachments = list(db.execute(
+        select(Attachment).where(Attachment.message_id == source.id)
+    ).scalars())
+    now = datetime.now(timezone.utc)
+    pending: list[tuple[Message, list[int], list[int]]] = []
+
+    for destination_id in payload.conversation_ids:
+        destination = db.get(Conversation, destination_id)
+        if destination is None or not service.user_is_participant(db, destination_id, current_user.id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="destination chat not found")
+
+        message = Message(
+            conversation_id=destination_id,
+            sender_id=current_user.id,
+            content=source.content,
+            type=source.type,
+            parent_id=None,
+            created_at=now,
+            disappear_after_seconds=destination.disappear_after_seconds,
+            forwarded=True,
+        )
+        db.add(message)
+        db.flush()
+        for attachment in source_attachments:
+            db.add(Attachment(
+                message_id=message.id,
+                url=attachment.url,
+                mime=attachment.mime,
+                size_bytes=attachment.size_bytes,
+            ))
+
+        recipient_ids = list(db.execute(
+            select(ConversationParticipant.user_id).where(
+                ConversationParticipant.conversation_id == destination_id,
+                ConversationParticipant.user_id != current_user.id,
+            )
+        ).scalars())
+        delivered_ids: list[int] = []
+        for recipient_id in recipient_ids:
+            is_online = connection_manager.is_online(recipient_id)
+            if is_online:
+                delivered_ids.append(recipient_id)
+            db.add(MessageStatus(
+                message_id=message.id,
+                user_id=recipient_id,
+                status=MessageStatusState.DELIVERED if is_online else MessageStatusState.SENT,
+            ))
+        destination.last_message_at = now
+        pending.append((message, recipient_ids, delivered_ids))
+
+    db.commit()
+
+    forwarded: list[MessageOut] = []
+    for message, recipient_ids, delivered_ids in pending:
+        db.refresh(message)
+        result = _build_message_out(db, message)
+        forwarded.append(result)
+        participant_ids = [*recipient_ids, current_user.id]
+        await connection_manager.broadcast_to_conversation(
+            conversation_id=message.conversation_id,
+            participant_ids=participant_ids,
+            payload={"type": "message.new", "message": result.model_dump(mode="json")},
+        )
+        for recipient_id in delivered_ids:
+            delivered_event: MessageDeliveredEvent = {
+                "type": "message.delivered",
+                "conversation_id": message.conversation_id,
+                "message_id": message.id,
+                "delivered_to": recipient_id,
+            }
+            await connection_manager.broadcast_to_conversation(
+                conversation_id=message.conversation_id,
+                participant_ids=participant_ids,
+                payload=delivered_event,
+            )
+    return forwarded
 
 
 @router.patch("/messages/{message_id}", response_model=MessageOut)
