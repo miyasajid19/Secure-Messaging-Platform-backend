@@ -41,6 +41,7 @@ from app.models import (
     MessageStatus,
     MessageStatusState,
     User,
+    UserAppSettings,
     MessageType,
 )
 from app.realtime import connection_manager
@@ -1082,6 +1083,11 @@ async def _handle_typing_start(sender_id: int, conversation_id: int) -> None:
     db = _db_session()
     try:
         participants = _participant_ids(db, conversation_id)
+        preferences = db.execute(select(UserAppSettings.preferences).where(UserAppSettings.user_id == sender_id)).scalar_one_or_none() or {}
+        privacy = preferences.get("privacy") if isinstance(preferences, dict) and isinstance(preferences.get("privacy"), dict) else {}
+        if privacy.get("typing_indicators", True) is False:
+            connection_manager.clear_typing(conversation_id, sender_id)
+            return
     finally:
         db.close()
     if not participants:

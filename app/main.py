@@ -35,6 +35,7 @@ from app.realtime.router import router as realtime_router
 from app.users.router import router as users_router
 from app.stories.router import router as stories_router
 from app.calls.router import router as calls_router
+from app.settings.router import router as settings_router
 from sqlalchemy import select
 
 log = logging.getLogger("main")
@@ -225,6 +226,7 @@ app.include_router(contacts_router)
 app.include_router(users_router)
 app.include_router(stories_router)
 app.include_router(calls_router)
+app.include_router(settings_router)
 app.include_router(realtime_router)
 
 

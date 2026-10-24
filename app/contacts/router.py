@@ -25,6 +25,7 @@ from app.models import (
     ConversationParticipant,
     ConversationType,
     User,
+    UserAppSettings,
 )
 from app.schemas import ContactOut, ConversationOut, UserOut
 
@@ -83,7 +84,13 @@ def _ensure_direct_conversation(
     conv = _find_direct_conversation(db, user_a_id, user_b_id)
     if conv is not None:
         return conv
-    conv = Conversation(type=ConversationType.DIRECT)
+    settings_row = db.execute(select(UserAppSettings).where(UserAppSettings.user_id == user_a_id)).scalar_one_or_none()
+    prefs = settings_row.preferences if settings_row and isinstance(settings_row.preferences, dict) else {}
+    chats = prefs.get("chats") if isinstance(prefs.get("chats"), dict) else {}
+    conv = Conversation(
+        type=ConversationType.DIRECT,
+        disappear_after_seconds=chats.get("default_disappearing_seconds"),
+    )
     db.add(conv)
     db.flush()
     db.add(ConversationParticipant(conversation_id=conv.id, user_id=user_a_id))

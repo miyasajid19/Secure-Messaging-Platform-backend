@@ -36,6 +36,7 @@ from app.models import (
     ParticipantRole,
     User,
     UserBlock,
+    UserAppSettings,
 )
 from app.realtime import connection_manager
 from app.realtime.events import (
@@ -138,8 +139,17 @@ def _seen_by_for(db: Session, message_ids: list[int]) -> dict[int, list[UserOut]
         )
         .order_by(MessageStatus.updated_at.asc(), MessageStatus.user_id.asc())
     ).all()
+    reader_ids = {user.id for _, user in rows}
+    settings_by_user = {
+        row.user_id: row.preferences
+        for row in db.execute(select(UserAppSettings).where(UserAppSettings.user_id.in_(reader_ids))).scalars()
+    } if reader_ids else {}
     seen_by: dict[int, list[UserOut]] = {}
     for mid, user in rows:
+        prefs = settings_by_user.get(user.id) or {}
+        privacy = prefs.get("privacy") if isinstance(prefs.get("privacy"), dict) else {}
+        if privacy.get("read_receipts", True) is False:
+            continue
         seen_by.setdefault(mid, []).append(UserOut.model_validate(user))
     return seen_by
 
@@ -1212,11 +1222,14 @@ async def mark_read(
         "reader_id": current_user.id,
         "up_to_message_id": payload.message_id,
     }
-    await connection_manager.broadcast_to_conversation(
-        conversation_id=conversation_id,
-        participant_ids=participant_ids,
-        payload=payload_out,
-    )
+    preferences = db.execute(select(UserAppSettings.preferences).where(UserAppSettings.user_id == current_user.id)).scalar_one_or_none() or {}
+    privacy = preferences.get("privacy") if isinstance(preferences, dict) and isinstance(preferences.get("privacy"), dict) else {}
+    if privacy.get("read_receipts", True):
+        await connection_manager.broadcast_to_conversation(
+            conversation_id=conversation_id,
+            participant_ids=participant_ids,
+            payload=payload_out,
+        )
 
     return ReadOut(marked_read=marked)
 
@@ -1278,6 +1291,12 @@ def get_message_status(
         .where(Message.conversation_id == conversation_id, Message.id.in_(ids))
     ).all()
 
+    recipient_ids = {recipient_id for _, sender_id, recipient_id, _ in rows if sender_id == current_user.id}
+    settings_by_recipient = {
+        row.user_id: row.preferences
+        for row in db.execute(select(UserAppSettings).where(UserAppSettings.user_id.in_(recipient_ids))).scalars()
+    } if recipient_ids else {}
+
     # Incoming messages expose this user's own delivery/read state.
     # For outgoing messages, aggregate recipient states using the least
     # advanced state so a group message reaches `read` only when every
@@ -1292,7 +1311,10 @@ def get_message_status(
     }
     for message_id, sender_id, recipient_id, state in rows:
         if sender_id == current_user.id:
-            outgoing.setdefault(message_id, []).append(state)
+            prefs = settings_by_recipient.get(recipient_id) or {}
+            privacy = prefs.get("privacy") if isinstance(prefs.get("privacy"), dict) else {}
+            visible_state = MessageStatusState.DELIVERED if state == MessageStatusState.READ and privacy.get("read_receipts", True) is False else state
+            outgoing.setdefault(message_id, []).append(visible_state)
         elif recipient_id == current_user.id:
             result[message_id] = state.value
 
@@ -1376,10 +1398,14 @@ async def create_conversation(
             )
 
     now = datetime.now(timezone.utc)
+    creator_settings = db.execute(select(UserAppSettings).where(UserAppSettings.user_id == current_user.id)).scalar_one_or_none()
+    creator_prefs = creator_settings.preferences if creator_settings and isinstance(creator_settings.preferences, dict) else {}
+    creator_chats = creator_prefs.get("chats") if isinstance(creator_prefs.get("chats"), dict) else {}
     conv = Conversation(
         type=ConversationType.GROUP,
         name=payload.name,
         avatar_url=payload.avatar_url,
+        disappear_after_seconds=creator_chats.get("default_disappearing_seconds"),
         created_at=now,
         last_message_at=now,
     )
