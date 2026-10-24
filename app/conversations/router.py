@@ -704,15 +704,16 @@ async def send_message(
     )
     db.add(msg)
     db.flush()  # so msg.id is populated
+    attachment_rows: list[Attachment] = []
     for attachment in payload.attachments:
-        db.add(
-            Attachment(
-                message_id=msg.id,
-                url=attachment.url,
-                mime=attachment.mime,
-                size_bytes=attachment.size_bytes,
-            )
+        attachment_row = Attachment(
+            message_id=msg.id,
+            url=attachment.url,
+            mime=attachment.mime,
+            size_bytes=attachment.size_bytes,
         )
+        db.add(attachment_row)
+        attachment_rows.append(attachment_row)
 
     # A recipient is delivered only when they have a live WebSocket
     # connection. Otherwise this stays `sent` until they reconnect.
@@ -746,10 +747,29 @@ async def send_message(
     current_user.last_seen = now
 
     db.commit()
-    db.refresh(msg)
 
-    # Build the response + WS broadcast payload.
-    out = _build_message_out(db, msg)
+    # This is a new message with no reactions, edits, receipts, or deletion
+    # state yet. Build its wire shape from objects already loaded in this
+    # request instead of issuing several read queries after every send.
+    out = MessageOut(
+        id=msg.id,
+        conversation_id=msg.conversation_id,
+        sender_id=msg.sender_id,
+        content=msg.content,
+        type=msg.type.value,
+        created_at=msg.created_at,
+        is_deleted=False,
+        forwarded=msg.forwarded,
+        edited_at=None,
+        previous_content=None,
+        parent_id=msg.parent_id,
+        disappear_after_seconds=msg.disappear_after_seconds,
+        sender=_user_out(current_user),
+        attachments=[AttachmentOut.model_validate(attachment) for attachment in attachment_rows],
+        seen_by=[],
+        parent=_parent_preview(db, msg) if msg.parent_id is not None else None,
+        reactions=[],
+    )
 
     broadcast: MessageNewEvent = {"type": "message.new", "message": out.model_dump(mode="json")}
     participant_ids = [uid for (uid,) in participant_rows] + [current_user.id]
@@ -758,16 +778,19 @@ async def send_message(
         participant_ids=participant_ids,
         payload=broadcast,
     )
-    for recipient_id in delivered_ids:
+    if delivered_ids:
+        # The sender only needs one aggregate delivery update. Broadcasting
+        # one event per recipient to every group member made each client
+        # refetch the full message-status map repeatedly.
         delivered_event: MessageDeliveredEvent = {
             "type": "message.delivered",
             "conversation_id": conversation_id,
             "message_id": msg.id,
-            "delivered_to": recipient_id,
+            "delivered_to": delivered_ids[0],
         }
         await connection_manager.broadcast_to_conversation(
             conversation_id=conversation_id,
-            participant_ids=participant_ids,
+            participant_ids=[current_user.id],
             payload=delivered_event,
         )
 

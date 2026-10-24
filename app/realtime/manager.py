@@ -43,9 +43,8 @@ class ConnectionManager:
     READY_WAIT_SECONDS: float = 0.5
 
     def __init__(self) -> None:
-        # user_id -> WebSocket. We allow only one socket per user; a
-        # second connection for the same user kicks the first.
-        self._connections: dict[int, WebSocket] = {}
+        # A user may have the app open in multiple tabs/devices.
+        self._connections: dict[int, dict[int, WebSocket]] = {}
         # (conversation_id, user_id) -> last typing timestamp (monotonic).
         self._typing: dict[tuple[int, int], float] = {}
         # Guards mutations on both dicts. Send paths take the lock
@@ -62,7 +61,7 @@ class ConnectionManager:
         # Used by the broadcast path to give the *sender's* connection
         # a moment to settle so they receive their own `message.new`
         # — see the UI-send race note in `app/realtime/router.py`.
-        self._ready_events: dict[int, asyncio.Event] = {}
+        self._ready_events: dict[tuple[int, int], asyncio.Event] = {}
 
     # --- Lifecycle -------------------------------------------------------
 
@@ -90,89 +89,64 @@ class ConnectionManager:
 
     # --- Connections -----------------------------------------------------
 
-    async def connect(self, user_id: int, ws: WebSocket) -> None:
-        """Register a socket for `user_id`.
-
-        If a prior socket is open for the same user, close it before
-        accepting the new one. The spec calls for "one socket per
-        user" so the UI never gets duplicate events.
-
-        Also creates an un-set `asyncio.Event` (the "ready" event)
-        that the WS handler will fire after sending the initial
-        snapshot. Broadcasts wait briefly on this event so they don't
-        miss a sender whose WS handshake hasn't quite finished.
-        """
+    async def connect(self, user_id: int, ws: WebSocket) -> bool:
+        """Register a socket; return True when this user just came online."""
         await ws.accept()
         async with self._lock:
-            existing = self._connections.get(user_id)
-            if existing is not None:
-                # Drop the old socket out from under it; FastAPI's
-                # WebSocket doesn't expose a clean way to close a
-                # specific peer, but send_text/binary raises once the
-                # peer has gone. Closing on the server side surfaces
-                # a clean 1001 to the previous client.
-                try:
-                    await existing.close(code=1000, reason="replaced")
-                except Exception:  # noqa: BLE001
-                    pass
-            self._connections[user_id] = ws
-            # Reset any stale ready event from a prior connection.
-            self._ready_events[user_id] = asyncio.Event()
+            first_connection = user_id not in self._connections
+            self._connections.setdefault(user_id, {})[id(ws)] = ws
+            self._ready_events[(user_id, id(ws))] = asyncio.Event()
         log.info("realtime: connect user_id=%s (online=%d)", user_id, len(self._connections))
+        return first_connection
 
-    async def disconnect(self, user_id: int, ws: WebSocket) -> None:
-        """Unregister a socket. Safe to call with a stale socket.
-
-        Only removes the entry if the registered socket is the one we
-        were given — that way a replaced connection doesn't
-        accidentally unregister the new one.
-        """
+    async def disconnect(self, user_id: int, ws: WebSocket) -> bool:
+        """Remove one socket; return True when the user is now offline."""
         async with self._lock:
-            if self._connections.get(user_id) is ws:
-                del self._connections[user_id]
-            # Drop the ready event too so a re-connect starts fresh.
-            self._ready_events.pop(user_id, None)
+            sockets = self._connections.get(user_id)
+            was_registered = sockets is not None and id(ws) in sockets
+            if was_registered and sockets is not None:
+                sockets.pop(id(ws), None)
+                if not sockets:
+                    self._connections.pop(user_id, None)
+            self._ready_events.pop((user_id, id(ws)), None)
+            user_offline = was_registered and user_id not in self._connections
         log.info("realtime: disconnect user_id=%s (online=%d)", user_id, len(self._connections))
+        return user_offline
 
     async def force_disconnect(self, user_id: int, code: int = 1000) -> bool:
-        """Close any active WS for `user_id` (logout, kick, etc.).
-
-        Returns True if a connection was actually closed, False if the
-        user was already offline. The caller is responsible for
-        broadcasting `presence {online: false}` to other users —
-        this method only handles the local cleanup.
-        """
+        """Close every active socket for this user (logout or account action)."""
         async with self._lock:
-            ws = self._connections.pop(user_id, None)
-            self._ready_events.pop(user_id, None)
-        if ws is None:
+            sockets = list(self._connections.pop(user_id, {}).values())
+            for ws in sockets:
+                self._ready_events.pop((user_id, id(ws)), None)
+        if not sockets:
             return False
-        try:
-            await ws.close(code=code)
-        except Exception as exc:  # noqa: BLE001
-            # The peer may have already gone; close is best-effort.
-            log.info("realtime: force_disconnect close raised: %s", exc)
+
+        async def close_one(ws: WebSocket) -> None:
+            try:
+                await ws.close(code=code)
+            except Exception as exc:  # noqa: BLE001
+                log.info("realtime: force_disconnect close raised: %s", exc)
+
+        await asyncio.gather(*(close_one(ws) for ws in sockets))
         log.info("realtime: force_disconnect user_id=%s code=%s", user_id, code)
         return True
 
-    def mark_ready(self, user_id: int) -> None:
-        """Fire the user's ready event (called after the snapshot is sent)."""
-        evt = self._ready_events.get(user_id)
-        if evt is not None:
-            evt.set()
+    def mark_ready(self, user_id: int, ws: WebSocket) -> None:
+        """Mark this socket ready after its initial snapshot has been sent."""
+        event = self._ready_events.get((user_id, id(ws)))
+        if event is not None:
+            event.set()
 
-    async def wait_for_ready(self, user_id: int, *, timeout: float = 0.5) -> None:
-        """Wait up to `timeout` seconds for the user's ready event.
-
-        No-op if the user has no ready event (offline, or already
-        ready). Returns silently on timeout — broadcasting to a not-
-        yet-ready user is a soft failure, not an error.
-        """
-        evt = self._ready_events.get(user_id)
-        if evt is None or evt.is_set():
+    async def wait_for_ready(
+        self, user_id: int, ws: WebSocket, *, timeout: float = 0.5
+    ) -> None:
+        """Wait briefly for this socket's initial snapshot to complete."""
+        event = self._ready_events.get((user_id, id(ws)))
+        if event is None or event.is_set():
             return
         try:
-            await asyncio.wait_for(evt.wait(), timeout=timeout)
+            await asyncio.wait_for(event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             return
 
@@ -185,21 +159,21 @@ class ConnectionManager:
     # --- Send -----------------------------------------------------------
 
     async def send_to_user(self, user_id: int, payload: dict) -> bool:
-        """Send to a single user. Returns True if the user was online.
+        """Send to all of a user's active tabs/devices; return if any send worked."""
+        sockets = self._copy_sockets([user_id])
+        if not sockets:
+            return False
 
-        Silently no-ops if the user is offline — the caller doesn't
-        need to special-case presence. Returns False so the caller
-        can log/metric if it cares.
-        """
-        ws = self._copy_socket(user_id)
-        if ws is None:
-            return False
-        try:
-            await ws.send_json(payload)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            log.warning("realtime: send_to_user(%s) failed: %s", user_id, exc)
-            return False
+        async def send_one(ws: WebSocket) -> bool:
+            try:
+                await ws.send_json(payload)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                log.warning("realtime: send_to_user(%s) failed: %s", user_id, exc)
+                return False
+
+        results = await asyncio.gather(*(send_one(ws) for _, ws in sockets))
+        return any(results)
 
     async def broadcast_to_conversation(
         self,
@@ -208,30 +182,22 @@ class ConnectionManager:
         payload: dict,
         exclude_user_id: Optional[int] = None,
     ) -> None:
-        """Send to every online participant in a conversation.
-
-        Takes the list of participant ids as a parameter (rather than
-        querying the DB) because the caller always already has it.
-
-        Each target gets a brief wait for their ready event — see
-        the UI-send race note in `app/realtime/router.py`. A target
-        that's slow to ready (or never will, because they disconnected
-        mid-broadcast) is silently skipped after `READY_WAIT_SECONDS`.
-        """
+        """Send to all ready sockets owned by the conversation participants."""
         targets = [uid for uid in participant_ids if uid != exclude_user_id]
-        # Wait for each target to be ready (max 0.5s). This is a
-        # best-effort, server-side mitigation for the UI-send race;
-        # the real fix is the frontend not sending until its WS is
-        # open.
-        for uid in targets:
-            await self.wait_for_ready(uid, timeout=self.READY_WAIT_SECONDS)
         sockets = self._copy_sockets(targets)
-        for uid, ws in sockets:
+        await asyncio.gather(*(
+            self.wait_for_ready(uid, ws, timeout=self.READY_WAIT_SECONDS)
+            for uid, ws in sockets
+        ))
+        sockets = self._copy_sockets(targets)
+
+        async def send_one(user_id: int, ws: WebSocket) -> None:
             try:
                 await ws.send_json(payload)
             except Exception as exc:  # noqa: BLE001
-                log.warning("realtime: broadcast send to %s failed: %s", uid, exc)
+                log.warning("realtime: broadcast send to %s failed: %s", user_id, exc)
 
+        await asyncio.gather(*(send_one(uid, ws) for uid, ws in sockets))
     # --- Typing ---------------------------------------------------------
 
     def mark_typing(self, conversation_id: int, user_id: int) -> None:
@@ -270,11 +236,8 @@ class ConnectionManager:
 
     # --- Internals ------------------------------------------------------
 
-    def _copy_socket(self, user_id: int) -> Optional[WebSocket]:
-        return self._connections.get(user_id)
-
     def _copy_sockets(self, user_ids: list[int]) -> list[tuple[int, WebSocket]]:
-        return [(uid, self._connections[uid]) for uid in user_ids if uid in self._connections]
+        return [(uid, ws) for uid in user_ids for ws in self._connections.get(uid, {}).values()]
 
     async def _typing_sweeper(self) -> None:
         """Periodically expire stale typing entries and broadcast stops.

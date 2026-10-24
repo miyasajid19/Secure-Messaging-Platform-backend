@@ -211,7 +211,7 @@ async def websocket_endpoint(
         return
 
     # --- 2. Register + presence snapshot -------------------------------
-    await connection_manager.connect(user.id, ws)
+    first_connection = await connection_manager.connect(user.id, ws)
     _bump_last_seen(user.id)
 
     snapshot: PresenceSnapshot = {
@@ -253,26 +253,27 @@ async def websocket_endpoint(
         await connection_manager.disconnect(user.id, ws)
         return
 
-    # Broadcast "I came online" to others.
-    presence_on: PresenceEvent = {
-        "type": "presence",
-        "user_id": user.id,
-        "online": True,
-    }
-    for other_id in connection_manager.online_users():
-        if other_id == user.id:
-            continue
-        await connection_manager.send_to_user(other_id, presence_on)
+    # Presence belongs to the user, not each browser tab.
+    if first_connection:
+        presence_on: PresenceEvent = {
+            "type": "presence",
+            "user_id": user.id,
+            "online": True,
+        }
+        for other_id in connection_manager.online_users():
+            if other_id != user.id:
+                await connection_manager.send_to_user(other_id, presence_on)
 
     # Mark this connection as ready. Broadcasts from this point on
     # will wait briefly for this event so the sender's WS is reliably
     # able to receive its own `message.new` — see the UI-send race
     # note in `manager.py` (READY_WAIT_SECONDS).
-    connection_manager.mark_ready(user.id)
+    connection_manager.mark_ready(user.id, ws)
 
     # Messages sent while this user was offline move from single-tick
     # `sent` to double-tick `delivered` as soon as they reconnect.
-    await _mark_pending_messages_delivered(user.id)
+    if first_connection:
+        await _mark_pending_messages_delivered(user.id)
 
     # --- 3. Reader loop -----------------------------------------------
     try:
@@ -316,14 +317,15 @@ async def websocket_endpoint(
         log.exception("realtime: ws loop error user_id=%s: %s", user.id, exc)
     finally:
         # --- 4. Disconnect + presence broadcast ------------------------
-        await connection_manager.disconnect(user.id, ws)
-        presence_off: PresenceEvent = {
-            "type": "presence",
-            "user_id": user.id,
-            "online": False,
-        }
-        for other_id in connection_manager.online_users():
-            await connection_manager.send_to_user(other_id, presence_off)
+        user_offline = await connection_manager.disconnect(user.id, ws)
+        if user_offline:
+            presence_off: PresenceEvent = {
+                "type": "presence",
+                "user_id": user.id,
+                "online": False,
+            }
+            for other_id in connection_manager.online_users():
+                await connection_manager.send_to_user(other_id, presence_off)
 
 
 # --- Event handlers (DB → broadcast) --------------------------------------
