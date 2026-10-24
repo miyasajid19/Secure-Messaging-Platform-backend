@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.auth.deps import get_current_user
 from app.database import get_db
-from app.models import Contact, ConversationParticipant, User
+from app.models import Contact, ConversationParticipant, User, UserAccountState
 from app.realtime import connection_manager
 from app.schemas import UserSearchResult
 
@@ -69,6 +69,7 @@ def search_users(
         db.execute(
             select(User)
             .where(User.id != current_user.id)
+            .where(~User.id.in_(select(UserAccountState.user_id).where(UserAccountState.status == "deletion_pending")))
             .where(
                 or_(
                     User.phone.like(phone_prefix),

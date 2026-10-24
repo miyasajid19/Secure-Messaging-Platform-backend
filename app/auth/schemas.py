@@ -74,6 +74,7 @@ class UserOut(BaseModel):
 class VerifyOtpOut(BaseModel):
     token: str
     user: UserOut
+    account_reactivated: bool = False
 
 
 # --- /auth/profile ------------------------------------------------------

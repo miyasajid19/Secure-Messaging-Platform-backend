@@ -42,6 +42,7 @@ from app.models import (
     MessageStatusState,
     User,
     UserAppSettings,
+    UserAccountState,
     MessageType,
 )
 from app.realtime import connection_manager
@@ -205,9 +206,11 @@ async def websocket_endpoint(
     db = _db_session()
     try:
         user = db.get(User, user_id)
+        lifecycle = db.get(UserAccountState, user_id)
+        blocked_status = lifecycle is not None and lifecycle.status in {"deactivated", "deletion_pending"}
     finally:
         db.close()
-    if user is None:
+    if user is None or blocked_status:
         await ws.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 

@@ -26,6 +26,7 @@ from app.models import (
     MessageStatus,
     MessageStatusState,
     User,
+    UserAccountState,
 )
 from app.schemas import (
     ConversationOut,
@@ -77,6 +78,7 @@ def get_participants(db: Session, conversation_id: int) -> list[User]:
             select(User)
             .join(ConversationParticipant, ConversationParticipant.user_id == User.id)
             .where(ConversationParticipant.conversation_id == conversation_id)
+            .where(~User.id.in_(select(UserAccountState.user_id).where(UserAccountState.status == "deletion_pending")))
             .order_by(ConversationParticipant.joined_at.asc(), User.id.asc())
         ).scalars()
     )

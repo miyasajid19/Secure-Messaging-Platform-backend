@@ -13,7 +13,7 @@ clients see the user go offline promptly. Revocation is out of scope
 for this milestone.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from pydantic import BaseModel
@@ -37,7 +37,7 @@ from app.auth.schemas import (
     VerifyOtpOut,
 )
 from app.database import get_db
-from app.models import User
+from app.models import User, UserAccountState
 from app.realtime import connection_manager
 from app.realtime.events import PresenceEvent
 
@@ -127,10 +127,61 @@ async def verify_otp(payload: VerifyOtpIn, db: Session = Depends(get_db)) -> Ver
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Firebase token does not verify this email address")
         user = _get_or_create_user_by_email(db, email)
 
+    # A verified sign-in during the 30-day grace period is the recovery
+    # action: retain the same user row and username, and cancel deletion.
+    lifecycle = db.execute(select(UserAccountState).where(UserAccountState.user_id == user.id).with_for_update()).scalar_one_or_none()
+    account_reactivated = lifecycle is not None and lifecycle.status in {"deletion_pending", "deactivated"}
+    if lifecycle is not None and lifecycle.status == "deletion_pending" and lifecycle.delete_after is not None and lifecycle.delete_after <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=410, detail="The 30-day account recovery period has ended")
+    if lifecycle is not None and lifecycle.status in {"deletion_pending", "deactivated"}:
+        lifecycle.status = "active"
+        lifecycle.deletion_requested_at = None
+        lifecycle.delete_after = None
     db.commit()
 
     token = encode_token(user_id=user.id, phone=user.phone, email=user.email)
-    return VerifyOtpOut(token=token, user=UserOut.model_validate(user))
+    return VerifyOtpOut(token=token, user=UserOut.model_validate(user), account_reactivated=account_reactivated)
+
+
+class AccountLifecycleOut(BaseModel):
+    status: str
+    delete_after: datetime | None = None
+
+
+@router.get("/auth/account-status", response_model=AccountLifecycleOut)
+def account_status(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> AccountLifecycleOut:
+    state = db.get(UserAccountState, current_user.id)
+    return AccountLifecycleOut(status=state.status if state else "active", delete_after=state.delete_after if state else None)
+
+
+@router.post("/auth/deactivate-account", response_model=AccountLifecycleOut)
+async def deactivate_account(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> AccountLifecycleOut:
+    state = db.get(UserAccountState, current_user.id)
+    if state is None:
+        state = UserAccountState(user_id=current_user.id)
+        db.add(state)
+    state.status = "deactivated"
+    state.deletion_requested_at = None
+    state.delete_after = None
+    db.commit()
+    await connection_manager.force_disconnect(current_user.id, code=1000)
+    return AccountLifecycleOut(status="deactivated")
+
+
+@router.post("/auth/delete-account", response_model=AccountLifecycleOut)
+async def schedule_account_deletion(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> AccountLifecycleOut:
+    now = datetime.now(timezone.utc)
+    delete_after = now + timedelta(days=30)
+    state = db.get(UserAccountState, current_user.id)
+    if state is None:
+        state = UserAccountState(user_id=current_user.id)
+        db.add(state)
+    state.status = "deletion_pending"
+    state.deletion_requested_at = now
+    state.delete_after = delete_after
+    db.commit()
+    await connection_manager.force_disconnect(current_user.id, code=1000)
+    return AccountLifecycleOut(status="deletion_pending", delete_after=delete_after)
 
 
 # --- /auth/me -----------------------------------------------------------

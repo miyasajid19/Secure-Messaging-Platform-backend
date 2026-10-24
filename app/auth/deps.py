@@ -23,6 +23,8 @@ from sqlalchemy.orm import Session
 from app.auth.jwt import decode_token
 from app.database import get_db
 from app.models import User
+from app.models import UserAccountState
+from sqlalchemy import select
 
 
 # `tokenUrl` is the docstring hint Swagger uses for the "Authorize" button.
@@ -68,5 +70,11 @@ def get_current_user(
     user = db.get(User, user_id) if user_id is not None else None
     if user is None:
         raise _credentials_error("User not found")
+
+    lifecycle = db.execute(select(UserAccountState.status).where(UserAccountState.user_id == user.id)).scalar_one_or_none()
+    if lifecycle == "deletion_pending":
+        raise HTTPException(status_code=403, detail="Account deletion is scheduled. Sign in again within 30 days to undo it.")
+    if lifecycle == "deactivated":
+        raise HTTPException(status_code=403, detail="Account is deactivated. Sign in again to reactivate it.")
 
     return user

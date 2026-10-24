@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.auth.deps import get_current_user
 from app.config import get_settings
 from app.database import get_db
-from app.models import Contact, Conversation, ConversationParticipant, ConversationType, Story, StoryReaction, StoryView, User
+from app.models import Contact, Conversation, ConversationParticipant, ConversationType, Story, StoryReaction, StoryView, User, UserAccountState
 
 router = APIRouter(prefix="/stories", tags=["stories"])
 
@@ -135,6 +135,7 @@ def _group_stories(db: Session, current_user: User) -> list[StoryGroup]:
         select(Story, User)
         .join(User, User.id == Story.user_id)
         .where(Story.expires_at > now, Story.user_id.in_(visible_user_ids))
+        .where(~Story.user_id.in_(select(UserAccountState.user_id).where(UserAccountState.status == "deletion_pending")))
         .order_by(Story.created_at.asc(), Story.id.asc())
     ).all()
     story_ids = [story.id for story, _ in rows]

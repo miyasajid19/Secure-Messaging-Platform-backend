@@ -26,6 +26,7 @@ from app.models import (
     ConversationType,
     User,
     UserAppSettings,
+    UserAccountState,
 )
 from app.schemas import ContactOut, ConversationOut, UserOut
 
@@ -118,6 +119,8 @@ def list_contacts(
     if not rows:
         return []
 
+    pending_user_ids = set(db.execute(select(UserAccountState.user_id).where(UserAccountState.status == "deletion_pending")).scalars())
+    rows = [row for row in rows if row.contact_id not in pending_user_ids]
     contact_user_ids = {c.contact_id for c in rows}
     users = {
         u.id: u
@@ -170,6 +173,9 @@ def add_contact(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="user not found",
         )
+    lifecycle = db.get(UserAccountState, target.id)
+    if lifecycle is not None and lifecycle.status == "deletion_pending":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
     if target.id == current_user.id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

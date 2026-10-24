@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import delete, or_, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
@@ -29,7 +30,10 @@ from app.config import get_settings
 from app.contacts.router import router as contacts_router
 from app.conversations.router import router as conversations_router
 from app.database import Base, SessionLocal, engine, get_db
-from app.models import ConversationParticipant
+from app.models import (
+    CallLog, Conversation, ConversationParticipant, ConversationType,
+    GroupCallLog, Message, User, UserAccountState,
+)
 from app.realtime import connection_manager
 from app.realtime.router import router as realtime_router
 from app.users.router import router as users_router
@@ -123,10 +127,45 @@ async def _disappearing_sweeper_task() -> None:
                 n = await _sweep_disappearing_once()
                 if n:
                     log.info("disappearing sweep: deleted %d message(s)", n)
+                deleted_accounts = _purge_due_accounts_once()
+                if deleted_accounts:
+                    log.info("account deletion sweep: permanently deleted %d account(s)", deleted_accounts)
             except Exception as exc:  # noqa: BLE001
                 log.warning("disappearing sweep error: %s", exc)
     finally:
         log.info("disappearing sweeper stopped")
+
+
+def _purge_due_accounts_once() -> int:
+    """Permanently purge accounts whose 30-day recovery period elapsed."""
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        due_states = list(db.execute(
+            select(UserAccountState).where(
+                UserAccountState.status == "deletion_pending",
+                UserAccountState.delete_after <= now,
+            ).limit(100).with_for_update(skip_locked=True)
+        ).scalars())
+        user_ids = [state.user_id for state in due_states]
+        for user_id in user_ids:
+            direct_ids = select(ConversationParticipant.conversation_id).join(
+                Conversation, Conversation.id == ConversationParticipant.conversation_id
+            ).where(
+                ConversationParticipant.user_id == user_id,
+                Conversation.type == ConversationType.DIRECT,
+            )
+            # Direct threads are private to the two participants; remove the
+            # thread as a whole. In groups, keep other members' history but
+            # remove the deleted account's authored messages.
+            db.execute(delete(Conversation).where(Conversation.id.in_(direct_ids)))
+            db.execute(delete(CallLog).where(or_(CallLog.caller_id == user_id, CallLog.callee_id == user_id)))
+            db.execute(delete(GroupCallLog).where(GroupCallLog.caller_id == user_id))
+            db.execute(delete(Message).where(Message.sender_id == user_id))
+            db.execute(delete(ConversationParticipant).where(ConversationParticipant.user_id == user_id))
+            db.execute(delete(User).where(User.id == user_id))
+        if user_ids:
+            db.commit()
+        return len(user_ids)
 
 
 @asynccontextmanager

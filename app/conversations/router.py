@@ -37,6 +37,7 @@ from app.models import (
     User,
     UserBlock,
     UserAppSettings,
+    UserAccountState,
 )
 from app.realtime import connection_manager
 from app.realtime.events import (
@@ -60,8 +61,23 @@ router = APIRouter(tags=["conversations"])
 
 # --- helpers --------------------------------------------------------------
 
-def _user_out(user: User) -> UserOut:
-    return UserOut.model_validate(user)
+def _user_out(user: User, db: Session | None = None) -> UserOut:
+    result = UserOut.model_validate(user)
+    state = db.get(UserAccountState, user.id) if db is not None else None
+    if state is not None and state.status == "deletion_pending":
+        return result.model_copy(update={"phone": None, "email": None, "username": None, "display_name": "Account unavailable", "avatar_url": None})
+    return result
+
+
+def _is_deletion_pending_direct_peer(db: Session, conversation_id: int, user_id: int) -> bool:
+    conversation = db.get(Conversation, conversation_id)
+    if conversation is None or conversation.type != ConversationType.DIRECT:
+        return False
+    peer_id = service.other_participant_id(db, conversation_id, user_id)
+    if peer_id is None:
+        return False
+    state = db.get(UserAccountState, peer_id)
+    return state is not None and state.status == "deletion_pending"
 
 
 def _messages_out(db: Session, msgs: list[Message]) -> list[MessageOut]:
@@ -107,7 +123,7 @@ def _messages_out(db: Session, msgs: list[Message]) -> list[MessageOut]:
             previous_content=None if message.deleted_at else edit_info.get(message.id, (None, None))[1],
             parent_id=message.parent_id,
             disappear_after_seconds=message.disappear_after_seconds,
-            sender=_user_out(sender),
+            sender=_user_out(sender, db),
             attachments=[] if message.deleted_at else [AttachmentOut.model_validate(item) for item in attachments_by_message.get(message.id, [])],
             seen_by=seen_by_map.get(message.id, []),
             parent=parents_map.get(message.id),
@@ -398,6 +414,8 @@ def list_conversations(
         ).scalars()
     )
     visible = [c for c in rows if (state := state_by_conversation.get(c.id)) is None or not state.hidden]
+    pending_ids = set(db.execute(select(UserAccountState.user_id).where(UserAccountState.status == "deletion_pending")).scalars())
+    visible = [c for c in visible if c.type != ConversationType.DIRECT or service.other_participant_id(db, c.id, current_user.id) not in pending_ids]
     visible = [c for c in visible if bool(state_by_conversation.get(c.id) and state_by_conversation[c.id].archived) == archived]
     visible.sort(key=lambda c: (not bool(state_by_conversation.get(c.id) and state_by_conversation[c.id].pinned), -(c.last_message_at or c.created_at).timestamp(), -c.id))
     return [service.to_conversation_out(db, c, current_user_id=current_user.id) for c in visible]
@@ -458,6 +476,8 @@ def list_conversation_media(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
+    if _is_deletion_pending_direct_peer(db, conversation_id, current_user.id):
+        raise HTTPException(status_code=404, detail="conversation not found")
     if not service.user_is_participant(db, conversation_id, current_user.id):
         raise HTTPException(status_code=404, detail="conversation not found")
     rows = db.execute(
@@ -517,6 +537,8 @@ def list_messages(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="conversation not found")
     if not service.user_is_participant(db, conversation_id, current_user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
+    if _is_deletion_pending_direct_peer(db, conversation_id, current_user.id):
+        raise HTTPException(status_code=404, detail="conversation not found")
 
     msgs = service.messages_before(
         db,
@@ -540,6 +562,8 @@ def search_messages(
     db: Session = Depends(get_db),
 ) -> List[MessageOut]:
     """Search text content in a conversation the caller belongs to."""
+    if _is_deletion_pending_direct_peer(db, conversation_id, current_user.id):
+        raise HTTPException(status_code=404, detail="conversation not found")
     if db.get(Conversation, conversation_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="conversation not found")
     if not service.user_is_participant(db, conversation_id, current_user.id):
@@ -728,7 +752,7 @@ def _build_message_out(db: Session, m: Message) -> MessageOut:
         previous_content=edit_info.previous_content if edit_info and not m.deleted_at else None,
         parent_id=m.parent_id,
         disappear_after_seconds=m.disappear_after_seconds,
-        sender=_user_out(sender) if sender else UserOut.model_validate(_empty_user()),
+        sender=_user_out(sender, db) if sender else UserOut.model_validate(_empty_user()),
         attachments=[] if m.deleted_at else [AttachmentOut.model_validate(a) for a in attachments],
         seen_by=seen_by_map.get(m.id, []),
         parent=parent_preview,
@@ -768,6 +792,10 @@ async def send_message(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
     if conv.type == ConversationType.DIRECT:
         other_id = service.other_participant_id(db, conversation_id, current_user.id)
+        if other_id is not None:
+            lifecycle = db.get(UserAccountState, other_id)
+            if lifecycle is not None and lifecycle.status == "deletion_pending":
+                raise HTTPException(status_code=404, detail="conversation not found")
         if other_id is not None and db.execute(select(UserBlock.id).where(
             ((UserBlock.blocker_id == current_user.id) & (UserBlock.blocked_id == other_id)) |
             ((UserBlock.blocker_id == other_id) & (UserBlock.blocked_id == current_user.id))
@@ -886,7 +914,7 @@ async def send_message(
         previous_content=None,
         parent_id=msg.parent_id,
         disappear_after_seconds=msg.disappear_after_seconds,
-        sender=_user_out(current_user),
+        sender=_user_out(current_user, db),
         attachments=[AttachmentOut.model_validate(attachment) for attachment in attachment_rows],
         seen_by=[],
         parent=_parent_preview(db, msg) if msg.parent_id is not None else None,
@@ -965,6 +993,8 @@ async def forward_message(
         destination = db.get(Conversation, destination_id)
         if destination is None or not service.user_is_participant(db, destination_id, current_user.id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="destination chat not found")
+        if _is_deletion_pending_direct_peer(db, destination_id, current_user.id):
+            raise HTTPException(status_code=404, detail="destination chat not found")
 
         message = Message(
             conversation_id=destination_id,
@@ -1384,6 +1414,14 @@ async def create_conversation(
         )
 
     if member_ids:
+        pending_member_ids = set(db.execute(
+            select(UserAccountState.user_id).where(
+                UserAccountState.status == "deletion_pending",
+                UserAccountState.user_id.in_(member_ids),
+            )
+        ).scalars())
+        if pending_member_ids:
+            raise HTTPException(status_code=404, detail="one or more users not found")
         existing_ids = {
             uid
             for (uid,) in db.execute(
@@ -1599,6 +1637,9 @@ async def add_member(
     target = db.get(User, payload.user_id)
     if target is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+    target_lifecycle = db.get(UserAccountState, target.id)
+    if target_lifecycle is not None and target_lifecycle.status == "deletion_pending":
+        raise HTTPException(status_code=404, detail="user not found")
 
     already = db.execute(
         select(ConversationParticipant.id).where(
@@ -1660,7 +1701,7 @@ async def add_member(
         payload=conv_payload,
     )
 
-    return AddMemberOut(added=_user_out(target))
+    return AddMemberOut(added=_user_out(target, db))
 
 
 # --- DELETE /conversations/{id}/members/{uid} ----------------------------

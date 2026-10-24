@@ -26,6 +26,7 @@ from app.models.call import CallLog
 from app.models.group_call import GroupCallLog
 from app.models.chat_action import ConversationUserState, HiddenMessage, UserBlock
 from app.models.app_settings import UserAppSettings
+from app.models.user_account_state import UserAccountState
 
 __all__ = [
     "Attachment",
@@ -50,4 +51,5 @@ __all__ = [
     "UserBlock",
     "HiddenMessage",
     "UserAppSettings",
+    "UserAccountState",
 ]

@@ -78,6 +78,7 @@ def blocked_users(current_user: User = Depends(get_current_user), db: Session = 
     users = db.execute(
         select(User).join(UserBlock, UserBlock.blocked_id == User.id)
         .where(UserBlock.blocker_id == current_user.id)
+        .where(~User.id.in_(select(UserAccountState.user_id).where(UserAccountState.status == "deletion_pending")))
         .order_by(User.display_name, User.id)
     ).scalars().all()
     return [UserOut.model_validate(user) for user in users]
