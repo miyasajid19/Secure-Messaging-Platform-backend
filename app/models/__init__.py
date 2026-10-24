@@ -20,6 +20,7 @@ from app.models.enums import (
 from app.models.message import Message, MessageStatus
 from app.models.reaction import MessageReaction
 from app.models.user import User
+from app.models.message_edit import MessageEdit
 from app.models.story import Story, StoryReaction, StoryView
 from app.models.call import CallLog
 from app.models.group_call import GroupCallLog
@@ -33,6 +34,7 @@ __all__ = [
     "Message",
     "MessageReaction",
     "MessageStatus",
+    "MessageEdit",
     "MessageStatusState",
     "MessageType",
     "ParticipantRole",

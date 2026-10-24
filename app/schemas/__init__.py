@@ -135,6 +135,8 @@ class MessageOut(BaseModel):
     content: str
     type: str
     created_at: datetime
+    edited_at: Optional[datetime] = None
+    previous_content: Optional[str] = None
     parent_id: Optional[int] = None
     # Expiry duration captured from the conversation setting when sent.
     disappear_after_seconds: Optional[int] = None

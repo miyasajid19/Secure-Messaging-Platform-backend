@@ -8,7 +8,7 @@ exists.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
@@ -26,6 +26,7 @@ from app.models import (
     ConversationParticipant,
     ConversationType,
     Message,
+    MessageEdit,
     MessageReaction,
     MessageStatus,
     MessageStatusState,
@@ -76,6 +77,13 @@ def _messages_out(db: Session, msgs: list[Message]) -> list[MessageOut]:
         select(Attachment).where(Attachment.message_id.in_(message_ids))
     ).scalars():
         attachments_by_message.setdefault(attachment.message_id, []).append(attachment)
+    edit_info = {
+        message_id: (edited_at, previous_content)
+        for message_id, edited_at, previous_content in db.execute(
+            select(MessageEdit.message_id, MessageEdit.edited_at, MessageEdit.previous_content)
+            .where(MessageEdit.message_id.in_(message_ids))
+        ).all()
+    }
 
     result: list[MessageOut] = []
     for message in msgs:
@@ -89,6 +97,8 @@ def _messages_out(db: Session, msgs: list[Message]) -> list[MessageOut]:
             content=message.content,
             type=message.type.value,
             created_at=message.created_at,
+            edited_at=edit_info.get(message.id, (None, None))[0],
+            previous_content=edit_info.get(message.id, (None, None))[1],
             parent_id=message.parent_id,
             disappear_after_seconds=message.disappear_after_seconds,
             sender=_user_out(sender),
@@ -587,6 +597,7 @@ def _build_message_out(db: Session, m: Message) -> MessageOut:
     seen_by_map = _seen_by_for(db, [m.id])
     parent_preview = _parent_preview(db, m)
     reactions = _reactions_for(db, [m.id]).get(m.id, [])
+    edit_info = db.get(MessageEdit, m.id)
     return MessageOut(
         id=m.id,
         conversation_id=m.conversation_id,
@@ -594,6 +605,8 @@ def _build_message_out(db: Session, m: Message) -> MessageOut:
         content=m.content,
         type=m.type.value,
         created_at=m.created_at,
+        edited_at=edit_info.edited_at if edit_info else None,
+        previous_content=edit_info.previous_content if edit_info else None,
         parent_id=m.parent_id,
         disappear_after_seconds=m.disappear_after_seconds,
         sender=_user_out(sender) if sender else UserOut.model_validate(_empty_user()),
@@ -751,6 +764,70 @@ async def send_message(
         )
 
     return out
+
+
+class EditMessageIn(BaseModel):
+    content: str = Field(min_length=1, max_length=10_000)
+
+    @model_validator(mode="after")
+    def require_non_blank_text(self):
+        if not self.content.strip():
+            raise ValueError("message text cannot be blank")
+        return self
+
+
+@router.patch("/messages/{message_id}", response_model=MessageOut)
+async def edit_message(
+    message_id: int,
+    payload: EditMessageIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MessageOut:
+    """Edit the text of the caller's own text-only message."""
+    message = db.get(Message, message_id)
+    if message is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="message not found")
+    if not service.user_is_participant(db, message.conversation_id, current_user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
+    if message.sender_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="you can only edit your own messages")
+    created_at = message.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) >= created_at + timedelta(minutes=13):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="the 13-minute edit window has expired")
+    if message.type != MessageType.TEXT or db.execute(
+        select(Attachment.id).where(Attachment.message_id == message.id).limit(1)
+    ).scalar_one_or_none() is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="only text-only messages can be edited")
+
+    now = datetime.now(timezone.utc)
+    edit_info = db.get(MessageEdit, message.id)
+    if edit_info is None:
+        edit_info = MessageEdit(
+            message_id=message.id,
+            previous_content=message.content,
+            edited_at=now,
+        )
+        db.add(edit_info)
+    else:
+        edit_info.previous_content = message.content
+        edit_info.edited_at = now
+    message.content = payload.content
+    db.commit()
+    db.refresh(message)
+    result = _build_message_out(db, message)
+    participant_ids = list(db.execute(
+        select(ConversationParticipant.user_id).where(
+            ConversationParticipant.conversation_id == message.conversation_id
+        )
+    ).scalars())
+    await connection_manager.broadcast_to_conversation(
+        conversation_id=message.conversation_id,
+        participant_ids=participant_ids,
+        payload={"type": "message.updated", "message": result.model_dump(mode="json")},
+    )
+    return result
 
 
 # --- /conversations/{id}/read --------------------------------------------

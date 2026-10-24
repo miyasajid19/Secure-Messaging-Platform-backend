@@ -165,6 +165,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             "ALTER TABLE stories ADD COLUMN IF NOT EXISTS "
             "media_type VARCHAR(16) NOT NULL DEFAULT 'image'"
         ))
+        # `create_all` does not add columns to an existing table. Older builds
+        # created message_edits with only edited_at, so add the history column
+        # in place. Keep it nullable for existing rows whose prior text was not
+        # recorded; new edits always write a value.
+        conn.execute(text(
+            "ALTER TABLE message_edits ADD COLUMN IF NOT EXISTS "
+            "previous_content TEXT"
+        ))
 
     # Start the typing-expiry sweeper (one background task per process).
     await connection_manager.start()
