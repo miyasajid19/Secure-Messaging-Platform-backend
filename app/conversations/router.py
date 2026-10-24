@@ -94,18 +94,19 @@ def _messages_out(db: Session, msgs: list[Message]) -> list[MessageOut]:
             id=message.id,
             conversation_id=message.conversation_id,
             sender_id=message.sender_id,
-            content=message.content,
+            content="" if message.deleted_at else message.content,
             type=message.type.value,
             created_at=message.created_at,
-            edited_at=edit_info.get(message.id, (None, None))[0],
-            previous_content=edit_info.get(message.id, (None, None))[1],
+            is_deleted=message.deleted_at is not None,
+            edited_at=None if message.deleted_at else edit_info.get(message.id, (None, None))[0],
+            previous_content=None if message.deleted_at else edit_info.get(message.id, (None, None))[1],
             parent_id=message.parent_id,
             disappear_after_seconds=message.disappear_after_seconds,
             sender=_user_out(sender),
-            attachments=[AttachmentOut.model_validate(item) for item in attachments_by_message.get(message.id, [])],
+            attachments=[] if message.deleted_at else [AttachmentOut.model_validate(item) for item in attachments_by_message.get(message.id, [])],
             seen_by=seen_by_map.get(message.id, []),
             parent=parents_map.get(message.id),
-            reactions=reactions_map.get(message.id, []),
+            reactions=[] if message.deleted_at else reactions_map.get(message.id, []),
         ))
     return result
 
@@ -171,7 +172,9 @@ def _parent_preview(db: Session, m: Message) -> Optional["MessageParent"]:
     sender_name = (sender.display_name or sender.phone or sender.email) if sender else None
 
     # Image and system messages don't have a useful text preview.
-    if parent.type == MessageType.IMAGE:
+    if parent.deleted_at is not None:
+        content = "Message deleted"
+    elif parent.type == MessageType.IMAGE:
         content = _PARENT_IMAGE_SENTINEL
     elif parent.type == MessageType.SYSTEM:
         content = _truncate_preview(parent.content, limit=60)
@@ -224,7 +227,9 @@ def _parents_for(db: Session, messages: list[Message]) -> dict[int, "MessagePare
             if sender and sender.display_name
             else ((sender.phone or sender.email) if sender else None)
         )
-        if parent.type == MessageType.IMAGE:
+        if parent.deleted_at is not None:
+            content = "Message deleted"
+        elif parent.type == MessageType.IMAGE:
             content = _PARENT_IMAGE_SENTINEL
         elif parent.type == MessageType.SYSTEM:
             content = _truncate_preview(parent.content, limit=60)
@@ -602,18 +607,19 @@ def _build_message_out(db: Session, m: Message) -> MessageOut:
         id=m.id,
         conversation_id=m.conversation_id,
         sender_id=m.sender_id,
-        content=m.content,
+        content="" if m.deleted_at else m.content,
         type=m.type.value,
         created_at=m.created_at,
-        edited_at=edit_info.edited_at if edit_info else None,
-        previous_content=edit_info.previous_content if edit_info else None,
+        is_deleted=m.deleted_at is not None,
+        edited_at=edit_info.edited_at if edit_info and not m.deleted_at else None,
+        previous_content=edit_info.previous_content if edit_info and not m.deleted_at else None,
         parent_id=m.parent_id,
         disappear_after_seconds=m.disappear_after_seconds,
         sender=_user_out(sender) if sender else UserOut.model_validate(_empty_user()),
-        attachments=[AttachmentOut.model_validate(a) for a in attachments],
+        attachments=[] if m.deleted_at else [AttachmentOut.model_validate(a) for a in attachments],
         seen_by=seen_by_map.get(m.id, []),
         parent=parent_preview,
-        reactions=reactions,
+        reactions=[] if m.deleted_at else reactions,
     )
 
 
@@ -791,6 +797,8 @@ async def edit_message(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
     if message.sender_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="you can only edit your own messages")
+    if message.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="a deleted message cannot be edited")
     created_at = message.created_at
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
@@ -816,6 +824,45 @@ async def edit_message(
     message.content = payload.content
     db.commit()
     db.refresh(message)
+    result = _build_message_out(db, message)
+    participant_ids = list(db.execute(
+        select(ConversationParticipant.user_id).where(
+            ConversationParticipant.conversation_id == message.conversation_id
+        )
+    ).scalars())
+    await connection_manager.broadcast_to_conversation(
+        conversation_id=message.conversation_id,
+        participant_ids=participant_ids,
+        payload={"type": "message.updated", "message": result.model_dump(mode="json")},
+    )
+    return result
+
+
+@router.delete("/messages/{message_id}", response_model=MessageOut)
+async def unsend_message(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MessageOut:
+    """Unsend the caller's message while keeping a tombstone in chat history."""
+    message = db.get(Message, message_id)
+    if message is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="message not found")
+    if not service.user_is_participant(db, message.conversation_id, current_user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
+    if message.sender_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="you can only unsend your own messages")
+    if message.deleted_at is None:
+        message.content = ""
+        message.deleted_at = datetime.now(timezone.utc)
+        db.execute(delete(Attachment).where(Attachment.message_id == message.id))
+        db.execute(delete(MessageReaction).where(MessageReaction.message_id == message.id))
+        edit_info = db.get(MessageEdit, message.id)
+        if edit_info is not None:
+            db.delete(edit_info)
+        db.commit()
+        db.refresh(message)
+
     result = _build_message_out(db, message)
     participant_ids = list(db.execute(
         select(ConversationParticipant.user_id).where(

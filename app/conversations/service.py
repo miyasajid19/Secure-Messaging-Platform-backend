@@ -205,7 +205,12 @@ def to_conversation_out(
 
     last_message_payload: Optional[MessagePreview] = None
     if last_msg is not None:
-        last_message_payload = MessagePreview.model_validate(last_msg)
+        last_message_payload = MessagePreview.model_validate(last_msg).model_copy(
+            update={
+                "content": "Message deleted" if last_msg.deleted_at else last_msg.content,
+                "is_deleted": last_msg.deleted_at is not None,
+            }
+        )
 
     my_role: Optional[str] = None
     if is_group:

@@ -32,6 +32,7 @@ class MessagePreview(BaseModel):
     content: str
     created_at: datetime
     type: str  # 'text' | 'image' | 'system' — kept as string to avoid coupling
+    is_deleted: bool = False
 
 
 class ConversationParticipantOut(UserOut):
@@ -135,6 +136,7 @@ class MessageOut(BaseModel):
     content: str
     type: str
     created_at: datetime
+    is_deleted: bool = False
     edited_at: Optional[datetime] = None
     previous_content: Optional[str] = None
     parent_id: Optional[int] = None

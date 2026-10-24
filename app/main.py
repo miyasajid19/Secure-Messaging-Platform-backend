@@ -173,6 +173,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             "ALTER TABLE message_edits ADD COLUMN IF NOT EXISTS "
             "previous_content TEXT"
         ))
+        conn.execute(text(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS "
+            "deleted_at TIMESTAMPTZ"
+        ))
 
     # Start the typing-expiry sweeper (one background task per process).
     await connection_manager.start()

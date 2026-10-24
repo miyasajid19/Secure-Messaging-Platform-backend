@@ -68,6 +68,12 @@ class Message(Base):
     # client/server should treat the message as gone after created_at + N.
     disappear_after_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
+    # Soft deletion keeps a tombstone in the timeline so every participant
+    # sees that a message was unsent, without retaining its original content.
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
 
 class MessageStatus(Base):
     __tablename__ = "message_status"
