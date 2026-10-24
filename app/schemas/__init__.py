@@ -72,6 +72,12 @@ class ConversationOut(BaseModel):
     # persist forever; 1/3600/86400/604800 = test/1h/1d/1w. Individual
     # messages copy this at send time.
     disappear_after_seconds: Optional[int] = None
+    muted: bool = False
+    pinned: bool = False
+    archived: bool = False
+    marked_unread: bool = False
+    blocked_by_me: bool = False
+    blocked_me: bool = False
 
 
 # --- /conversations/{id}/messages ---------------------------------------

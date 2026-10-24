@@ -24,6 +24,7 @@ from app.models.message_edit import MessageEdit
 from app.models.story import Story, StoryReaction, StoryView
 from app.models.call import CallLog
 from app.models.group_call import GroupCallLog
+from app.models.chat_action import ConversationUserState, HiddenMessage, UserBlock
 
 __all__ = [
     "Attachment",
@@ -44,4 +45,7 @@ __all__ = [
     "StoryReaction",
     "CallLog",
     "GroupCallLog",
+    "ConversationUserState",
+    "UserBlock",
+    "HiddenMessage",
 ]

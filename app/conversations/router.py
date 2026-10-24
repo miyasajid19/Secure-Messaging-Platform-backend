@@ -24,6 +24,8 @@ from app.models import (
     Attachment,
     Conversation,
     ConversationParticipant,
+    ConversationUserState,
+    HiddenMessage,
     ConversationType,
     Message,
     MessageEdit,
@@ -33,6 +35,7 @@ from app.models import (
     MessageType,
     ParticipantRole,
     User,
+    UserBlock,
 )
 from app.realtime import connection_manager
 from app.realtime.events import (
@@ -353,6 +356,7 @@ def _emit_system_message(
 
 @router.get("/conversations", response_model=List[ConversationOut])
 def list_conversations(
+    archived: bool = Query(default=False),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[ConversationOut]:
@@ -367,6 +371,10 @@ def list_conversations(
         .where(ConversationParticipant.user_id == current_user.id)
     )
 
+    state_rows = db.execute(select(ConversationUserState).where(
+        ConversationUserState.user_id == current_user.id
+    )).scalars().all()
+    state_by_conversation = {state.conversation_id: state for state in state_rows}
     rows = list(
         db.execute(
             select(Conversation)
@@ -379,8 +387,99 @@ def list_conversations(
             )
         ).scalars()
     )
+    visible = [c for c in rows if (state := state_by_conversation.get(c.id)) is None or not state.hidden]
+    visible = [c for c in visible if bool(state_by_conversation.get(c.id) and state_by_conversation[c.id].archived) == archived]
+    visible.sort(key=lambda c: (not bool(state_by_conversation.get(c.id) and state_by_conversation[c.id].pinned), -(c.last_message_at or c.created_at).timestamp(), -c.id))
+    return [service.to_conversation_out(db, c, current_user_id=current_user.id) for c in visible]
 
-    return [service.to_conversation_out(db, c, current_user_id=current_user.id) for c in rows]
+
+class ConversationActionsIn(BaseModel):
+    muted: Optional[bool] = None
+    pinned: Optional[bool] = None
+    archived: Optional[bool] = None
+    marked_unread: Optional[bool] = None
+
+
+def _conversation_state(db: Session, conversation_id: int, user_id: int) -> ConversationUserState:
+    state = db.execute(select(ConversationUserState).where(
+        ConversationUserState.conversation_id == conversation_id,
+        ConversationUserState.user_id == user_id,
+    )).scalar_one_or_none()
+    if state is None:
+        state = ConversationUserState(conversation_id=conversation_id, user_id=user_id)
+        db.add(state)
+        db.flush()
+    return state
+
+
+@router.patch("/conversations/{conversation_id}/actions", response_model=ConversationOut)
+def update_conversation_actions(
+    conversation_id: int,
+    payload: ConversationActionsIn,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ConversationOut:
+    if not service.user_is_participant(db, conversation_id, current_user.id):
+        raise HTTPException(status_code=404, detail="conversation not found")
+    state = _conversation_state(db, conversation_id, current_user.id)
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(state, key, value)
+    db.commit()
+    return service.to_conversation_out(db, db.get(Conversation, conversation_id), current_user_id=current_user.id)
+
+
+@router.delete("/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_conversation_for_me(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    if not service.user_is_participant(db, conversation_id, current_user.id):
+        raise HTTPException(status_code=404, detail="conversation not found")
+    state = _conversation_state(db, conversation_id, current_user.id)
+    state.hidden = True
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/conversations/{conversation_id}/media")
+def list_conversation_media(
+    conversation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    if not service.user_is_participant(db, conversation_id, current_user.id):
+        raise HTTPException(status_code=404, detail="conversation not found")
+    rows = db.execute(
+        select(Attachment, Message.created_at, Message.sender_id)
+        .join(Message, Message.id == Attachment.message_id)
+        .where(Message.conversation_id == conversation_id, Message.deleted_at.is_(None))
+        .where(Message.id.not_in(select(HiddenMessage.message_id).where(HiddenMessage.user_id == current_user.id)))
+        .order_by(Message.created_at.desc(), Attachment.id.desc())
+        .limit(500)
+    ).all()
+    return [{"id": attachment.id, "url": attachment.url, "mime": attachment.mime,
+             "size_bytes": attachment.size_bytes, "message_id": attachment.message_id,
+             "created_at": created_at, "sender_id": sender_id}
+            for attachment, created_at, sender_id in rows]
+
+
+@router.post("/users/{user_id}/block", status_code=status.HTTP_204_NO_CONTENT)
+def block_user(user_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> Response:
+    if user_id == current_user.id or db.get(User, user_id) is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    exists = db.execute(select(UserBlock.id).where(UserBlock.blocker_id == current_user.id, UserBlock.blocked_id == user_id)).scalar_one_or_none()
+    if exists is None:
+        db.add(UserBlock(blocker_id=current_user.id, blocked_id=user_id))
+        db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete("/users/{user_id}/block", status_code=status.HTTP_204_NO_CONTENT)
+def unblock_user(user_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> Response:
+    db.execute(delete(UserBlock).where(UserBlock.blocker_id == current_user.id, UserBlock.blocked_id == user_id))
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- /conversations/{id}/messages ----------------------------------------
@@ -414,8 +513,8 @@ def list_messages(
         conversation_id=conversation_id,
         limit=limit,
         before_id=before,
+        user_id=current_user.id,
     )
-
     return _messages_out(db, msgs)
 
 
@@ -435,6 +534,7 @@ def search_messages(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="conversation not found")
     if not service.user_is_participant(db, conversation_id, current_user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
+
     escaped = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     if len(escaped) < 2:
         return []
@@ -444,6 +544,7 @@ def search_messages(
         .where(
             Message.conversation_id == conversation_id,
             Message.content.ilike(pattern, escape="\\"),
+            Message.id.not_in(select(HiddenMessage.message_id).where(HiddenMessage.user_id == current_user.id)),
         )
         .order_by(Message.created_at.desc(), Message.id.desc())
         .limit(limit)
@@ -655,6 +756,13 @@ async def send_message(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="conversation not found")
     if not service.user_is_participant(db, conversation_id, current_user.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
+    if conv.type == ConversationType.DIRECT:
+        other_id = service.other_participant_id(db, conversation_id, current_user.id)
+        if other_id is not None and db.execute(select(UserBlock.id).where(
+            ((UserBlock.blocker_id == current_user.id) & (UserBlock.blocked_id == other_id)) |
+            ((UserBlock.blocker_id == other_id) & (UserBlock.blocked_id == current_user.id))
+        ).limit(1)).scalar_one_or_none() is not None:
+            raise HTTPException(status_code=403, detail="messages are blocked for this conversation")
 
     # Validate parent_id (Phase 8.1): must reference a real message in
     # the SAME conversation. Otherwise the reply's quoted preview
@@ -725,6 +833,10 @@ async def send_message(
             )
         )
     )
+    db.execute(update(ConversationUserState).where(
+        ConversationUserState.conversation_id == conversation_id,
+        ConversationUserState.user_id.in_([current_user.id, *(uid for (uid,) in participant_rows)]),
+    ).values(hidden=False))
     delivered_ids: list[int] = []
     for (uid,) in participant_rows:
         is_online = connection_manager.is_online(uid)
@@ -1006,6 +1118,24 @@ async def unsend_message(
     return result
 
 
+@router.delete("/messages/{message_id}/for-me", status_code=status.HTTP_204_NO_CONTENT)
+def hide_message_for_me(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    message = db.get(Message, message_id)
+    if message is None or not service.user_is_participant(db, message.conversation_id, current_user.id):
+        raise HTTPException(status_code=404, detail="message not found")
+    exists = db.execute(select(HiddenMessage.id).where(
+        HiddenMessage.message_id == message_id, HiddenMessage.user_id == current_user.id
+    )).scalar_one_or_none()
+    if exists is None:
+        db.add(HiddenMessage(message_id=message_id, user_id=current_user.id))
+        db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 # --- /conversations/{id}/read --------------------------------------------
 
 
@@ -1043,6 +1173,12 @@ async def mark_read(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
 
     now = datetime.now(timezone.utc)
+    state = db.execute(select(ConversationUserState).where(
+        ConversationUserState.conversation_id == conversation_id,
+        ConversationUserState.user_id == current_user.id,
+    )).scalar_one_or_none()
+    if state is not None:
+        state.marked_unread = False
     # Single UPDATE … WHERE … IN (SELECT …) query, as the spec asks.
     result = db.execute(
         update(MessageStatus)

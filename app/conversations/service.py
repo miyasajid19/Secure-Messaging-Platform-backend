@@ -19,6 +19,9 @@ from sqlalchemy.orm import Session
 from app.models import (
     Conversation,
     ConversationParticipant,
+    ConversationUserState,
+    HiddenMessage,
+    UserBlock,
     Message,
     MessageStatus,
     MessageStatusState,
@@ -116,6 +119,7 @@ def messages_before(
     conversation_id: int,
     limit: int,
     before_id: Optional[int],
+    user_id: Optional[int] = None,
 ) -> list[Message]:
     """Return up to `limit` messages older than `before_id`, ASC by time.
 
@@ -135,6 +139,10 @@ def messages_before(
     )
     if before_id is not None:
         stmt = stmt.where(Message.id < before_id)
+    if user_id is not None:
+        stmt = stmt.where(Message.id.not_in(
+            select(HiddenMessage.message_id).where(HiddenMessage.user_id == user_id)
+        ))
     return list(db.execute(stmt).scalars())
 
 
@@ -189,6 +197,10 @@ def to_conversation_out(
     """
     last_msg = get_last_message(db, conv.id)
     unread = get_unread_count(db, conv.id, current_user_id)
+    state = db.execute(select(ConversationUserState).where(
+        ConversationUserState.conversation_id == conv.id,
+        ConversationUserState.user_id == current_user_id,
+    )).scalar_one_or_none()
     participants = get_participants(db, conv.id)
     participant_roles = {
         participant.user_id: participant.role.value
@@ -198,6 +210,15 @@ def to_conversation_out(
     }
 
     is_group = conv.type.value == "group"
+    other_id = None if is_group else other_participant_id(db, conv.id, current_user_id)
+    blocked_by_me = blocked_me = False
+    if other_id is not None:
+        blocked_by_me = db.execute(select(UserBlock.id).where(
+            UserBlock.blocker_id == current_user_id, UserBlock.blocked_id == other_id
+        )).scalar_one_or_none() is not None
+        blocked_me = db.execute(select(UserBlock.id).where(
+            UserBlock.blocker_id == other_id, UserBlock.blocked_id == current_user_id
+        )).scalar_one_or_none() is not None
     if is_group:
         avatar = conv.avatar_url or group_avatar_url(conv)
     else:
@@ -231,7 +252,7 @@ def to_conversation_out(
         created_at=conv.created_at,
         last_message_at=conv.last_message_at,
         last_message=last_message_payload,
-        unread_count=unread,
+        unread_count=max(unread, 1) if state and state.marked_unread else unread,
         avatar_url=avatar,
         participants=[
             ConversationParticipantOut.model_validate(u).model_copy(
@@ -242,4 +263,10 @@ def to_conversation_out(
         members_can_be_added=is_group,
         my_role=my_role,
         disappear_after_seconds=conv.disappear_after_seconds,
+        muted=state.muted if state else False,
+        pinned=state.pinned if state else False,
+        archived=state.archived if state else False,
+        marked_unread=state.marked_unread if state else False,
+        blocked_by_me=blocked_by_me,
+        blocked_me=blocked_me,
     )
