@@ -59,6 +59,47 @@ def _user_out(user: User) -> UserOut:
     return UserOut.model_validate(user)
 
 
+def _messages_out(db: Session, msgs: list[Message]) -> list[MessageOut]:
+    if not msgs:
+        return []
+    sender_ids = {message.sender_id for message in msgs}
+    senders = {
+        user.id: user
+        for user in db.execute(select(User).where(User.id.in_(sender_ids))).scalars()
+    }
+    message_ids = [message.id for message in msgs]
+    seen_by_map = _seen_by_for(db, message_ids)
+    parents_map = _parents_for(db, msgs)
+    reactions_map = _reactions_for(db, message_ids)
+    attachments_by_message: dict[int, list[Attachment]] = {}
+    for attachment in db.execute(
+        select(Attachment).where(Attachment.message_id.in_(message_ids))
+    ).scalars():
+        attachments_by_message.setdefault(attachment.message_id, []).append(attachment)
+
+    result: list[MessageOut] = []
+    for message in msgs:
+        sender = senders.get(message.sender_id)
+        if sender is None:
+            continue
+        result.append(MessageOut(
+            id=message.id,
+            conversation_id=message.conversation_id,
+            sender_id=message.sender_id,
+            content=message.content,
+            type=message.type.value,
+            created_at=message.created_at,
+            parent_id=message.parent_id,
+            disappear_after_seconds=message.disappear_after_seconds,
+            sender=_user_out(sender),
+            attachments=[AttachmentOut.model_validate(item) for item in attachments_by_message.get(message.id, [])],
+            seen_by=seen_by_map.get(message.id, []),
+            parent=parents_map.get(message.id),
+            reactions=reactions_map.get(message.id, []),
+        ))
+    return result
+
+
 def _seen_by_for(db: Session, message_ids: list[int]) -> dict[int, list[UserOut]]:
     """Batch-fetch "seen by" users for a set of message ids.
 
@@ -359,58 +400,76 @@ def list_messages(
         before_id=before,
     )
 
-    if not msgs:
+    return _messages_out(db, msgs)
+
+
+@router.get(
+    "/conversations/{conversation_id}/messages/search",
+    response_model=List[MessageOut],
+)
+def search_messages(
+    conversation_id: int,
+    q: str = Query(min_length=2, max_length=100),
+    limit: int = Query(default=30, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[MessageOut]:
+    """Search text content in a conversation the caller belongs to."""
+    if db.get(Conversation, conversation_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="conversation not found")
+    if not service.user_is_participant(db, conversation_id, current_user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
+    escaped = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    if len(escaped) < 2:
         return []
-
-    # Batch-load senders + attachments + seen_by + parents + reactions
-    # to avoid N+1 on the chat pane. 6 queries total: messages, senders,
-    # attachments, message_status+users (for seen_by), parents,
-    # message_reactions+users (for reactions).
-    sender_ids = {m.sender_id for m in msgs}
-    senders = {
-        u.id: u
-        for u in db.execute(select(User).where(User.id.in_(sender_ids))).scalars()
-    }
-    message_ids = [m.id for m in msgs]
-    seen_by_map = _seen_by_for(db, message_ids)
-    parents_map = _parents_for(db, msgs)
-    reactions_map = _reactions_for(db, message_ids)
-    attachments_by_msg: dict[int, list[Attachment]] = {}
-    for att in db.execute(
-        select(Attachment).where(Attachment.message_id.in_(message_ids))
-    ).scalars():
-        attachments_by_msg.setdefault(att.message_id, []).append(att)
-
-    out: List[MessageOut] = []
-    for m in msgs:
-        sender = senders.get(m.sender_id)
-        if sender is None:
-            # Sender FK is RESTRICT, so this would be a DB inconsistency;
-            # surface a clean 500-ish but the spec only has 4xx, so 200
-            # with a null sender is the least bad option. In practice
-            # this branch is unreachable.
-            continue
-        out.append(
-            MessageOut(
-                id=m.id,
-                conversation_id=m.conversation_id,
-                sender_id=m.sender_id,
-                content=m.content,
-                type=m.type.value,
-                created_at=m.created_at,
-                parent_id=m.parent_id,
-                disappear_after_seconds=m.disappear_after_seconds,
-                sender=_user_out(sender),
-                attachments=[
-                    AttachmentOut.model_validate(a)
-                    for a in attachments_by_msg.get(m.id, [])
-                ],
-                seen_by=seen_by_map.get(m.id, []),
-                parent=parents_map.get(m.id),
-                reactions=reactions_map.get(m.id, []),
-            )
+    pattern = f"%{escaped}%"
+    matches = list(db.execute(
+        select(Message)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.content.ilike(pattern, escape="\\"),
         )
-    return out
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(limit)
+    ).scalars())
+    return _messages_out(db, matches)
+
+
+@router.get(
+    "/conversations/{conversation_id}/messages/context",
+    response_model=List[MessageOut],
+)
+def message_context(
+    conversation_id: int,
+    message_id: int = Query(ge=1),
+    radius: int = Query(default=25, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[MessageOut]:
+    """Fetch a small timeline centered on a searched message."""
+    if db.get(Conversation, conversation_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="conversation not found")
+    if not service.user_is_participant(db, conversation_id, current_user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not a participant")
+    target = db.execute(select(Message.id).where(
+        Message.id == message_id,
+        Message.conversation_id == conversation_id,
+    )).scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="message not found")
+    before = list(db.execute(
+        select(Message)
+        .where(Message.conversation_id == conversation_id, Message.id <= message_id)
+        .order_by(Message.id.desc())
+        .limit(radius + 1)
+    ).scalars())
+    after = list(db.execute(
+        select(Message)
+        .where(Message.conversation_id == conversation_id, Message.id > message_id)
+        .order_by(Message.id.asc())
+        .limit(radius)
+    ).scalars())
+    return _messages_out(db, list(reversed(before)) + after)
 
 
 # --- /conversations/{id}/messages (POST) ---------------------------------
