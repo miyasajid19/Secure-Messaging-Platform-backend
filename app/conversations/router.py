@@ -864,6 +864,7 @@ class CreateGroupIn(BaseModel):
         default_factory=list,
         description="User ids to add. The caller's id is silently deduped (UI flows naturally include the caller).",
     )
+    admin_ids: List[int] = Field(default_factory=list, description="Optional members to make admins at creation.")
 
 
 @router.post(
@@ -905,6 +906,12 @@ async def create_conversation(
     member_ids = [
         uid for uid in dict.fromkeys(payload.member_ids) if uid != current_user.id
     ]
+    admin_ids = {uid for uid in payload.admin_ids if uid != current_user.id}
+    if not admin_ids.issubset(set(member_ids)):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="admin_ids must be included in member_ids",
+        )
 
     if member_ids:
         existing_ids = {
@@ -945,7 +952,7 @@ async def create_conversation(
             ConversationParticipant(
                 conversation_id=conv.id,
                 user_id=uid,
-                role=ParticipantRole.MEMBER,
+                role=ParticipantRole.ADMIN if uid in admin_ids else ParticipantRole.MEMBER,
                 joined_at=now,
             )
         )

@@ -421,6 +421,145 @@ async def _handle_call_event(sender_id: int, data: dict) -> None:
                 )
             return
 
+        if event_type == "call.upgrade":
+            call_log = db.execute(select(CallLog).where(CallLog.call_id == call_id)).scalar_one_or_none()
+            try:
+                group_call_id = str(uuid.UUID(str(data.get("group_call_id"))))
+            except (ValueError, TypeError, AttributeError):
+                await connection_manager.send_to_user(sender_id, {
+                    "type": "call.error", "call_id": call_id,
+                    "message": "Invalid group call session",
+                })
+                return
+            group_conversation_id = data.get("group_conversation_id")
+            group_conversation = db.get(Conversation, group_conversation_id) if type(group_conversation_id) is int else None
+            group_call = db.get(GroupCallLog, group_call_id)
+            invitee_ids = data.get("invitee_user_ids", [])
+            valid_invitee_ids = (
+                isinstance(invitee_ids, list)
+                and len(invitee_ids) <= 7
+                and all(type(user_id) is int for user_id in invitee_ids)
+                and len(set(invitee_ids)) == len(invitee_ids)
+                and not (set(invitee_ids) & {sender_id, target_id})
+            )
+            group_members = set(db.execute(
+                select(ConversationParticipant.user_id).where(
+                    ConversationParticipant.conversation_id == group_conversation_id
+                )
+            ).scalars()) if group_conversation else set()
+            direct_members = {sender_id, target_id}
+            if (
+                call_log is None
+                or call_log.conversation_id != conversation_id
+                or {call_log.caller_id, call_log.callee_id} != direct_members
+                or call_log.status != "active"
+                or group_conversation is None
+                or group_conversation.type != ConversationType.GROUP
+                or not direct_members.issubset(group_members)
+                or not valid_invitee_ids
+                or not set(invitee_ids).issubset(group_members)
+                or (group_call is not None and (
+                    group_call.conversation_id != group_conversation_id
+                    or group_call.caller_id != sender_id
+                    or sender_id not in group_call.participant_ids
+                    or group_call.status not in {"ringing", "active"}
+                    or group_call.media_type != call_log.media_type
+                ))
+            ):
+                await connection_manager.send_to_user(sender_id, {
+                    "type": "call.error", "call_id": call_id,
+                    "message": "Could not move this call into a group call",
+                })
+                return
+            if group_call is None:
+                # The upgrade request is self-contained: create the group call
+                # session here so a missing/late invite event cannot leave the
+                # UI in a group call that the server cannot route.
+                group_call = GroupCallLog(
+                    call_id=group_call_id,
+                    conversation_id=group_conversation_id,
+                    caller_id=sender_id,
+                    media_type=call_log.media_type,
+                    status="active",
+                    participant_ids=[sender_id, target_id],
+                    invited_user_ids=list(invitee_ids),
+                )
+                db.add(group_call)
+            # Preserve the two existing callers as participants in the new
+            # session. Their existing peer connection stays live; new contacts
+            # only add extra peer connections after they accept.
+            if target_id not in group_call.participant_ids:
+                group_call.participant_ids = [*group_call.participant_ids, target_id]
+            group_call.invited_user_ids = list(dict.fromkeys([
+                *[user_id for user_id in group_call.invited_user_ids if user_id not in {sender_id, target_id}],
+                *invitee_ids,
+            ]))
+            group_call.status = "active"
+            call_log.status = "completed"
+            call_log.ended_at = datetime.now(timezone.utc)
+            duration = data.get("duration_seconds", 0)
+            if type(duration) is int and 0 <= duration <= 86_400:
+                call_log.duration_seconds = duration
+            db.commit()
+            group_participants = []
+            for user_id in group_call.participant_ids:
+                group_user = db.get(User, user_id)
+                if group_user:
+                    group_participants.append({
+                        "id": group_user.id,
+                        "display_name": group_user.display_name or group_user.username or group_user.phone or group_user.email or "Signal user",
+                        "avatar_url": group_user.avatar_url,
+                    })
+            await connection_manager.send_to_user(target_id, {
+                "type": "call.upgraded", "call_id": call_id,
+                "conversation_id": conversation_id,
+                "from_user_id": sender_id,
+                "from_name": sender_name,
+                "group_call_id": group_call_id,
+                "group_conversation_id": group_conversation_id,
+                "group_name": group_conversation.name or "Group call",
+                "media_type": group_call.media_type,
+                "participants": group_participants,
+            })
+            active_state = {
+                "type": "call.group_state", "active": True,
+                "call_id": group_call_id,
+                "conversation_id": group_conversation_id,
+                "caller_id": group_call.caller_id,
+                "group_name": group_conversation.name or "Group call",
+                "media_type": group_call.media_type,
+                "participants": group_participants,
+            }
+            for member_id in group_members:
+                await connection_manager.send_to_user(member_id, active_state)
+            delivered_invites = []
+            for invitee_id in group_call.invited_user_ids:
+                if await connection_manager.send_to_user(invitee_id, {
+                    "type": "call.incoming",
+                    "call_id": group_call_id,
+                    "conversation_id": group_conversation_id,
+                    "from_user_id": sender_id,
+                    "from_name": sender_name,
+                    "from_avatar_url": sender.avatar_url if sender else None,
+                    "media_type": group_call.media_type,
+                    "is_group": True,
+                    "group_name": group_conversation.name or "Group call",
+                    "caller_id": sender_id,
+                    "participants": group_participants,
+                }):
+                    delivered_invites.append(invitee_id)
+            await connection_manager.send_to_user(sender_id, {
+                "type": "call.invite_result",
+                "call_id": group_call_id,
+                "conversation_id": group_conversation_id,
+                "delivered_user_ids": delivered_invites,
+                "offline_user_ids": [
+                    user_id for user_id in group_call.invited_user_ids
+                    if user_id not in delivered_invites
+                ],
+            })
+            return
+
         outgoing_types = {
             "call.accept": "call.accepted",
             "call.reject": "call.rejected",
@@ -521,6 +660,11 @@ async def _handle_group_call_event(
     sender = db.get(User, sender_id)
     if sender is None:
         return
+    if sender_id not in conversation_participants:
+        await connection_manager.send_to_user(sender_id, {
+            "type": "call.error", "message": "You are not a member of this group"
+        })
+        return
     sender_name = sender.display_name or sender.username or sender.phone or sender.email or "Signal user"
 
     if event_type == "call.invite":
@@ -541,39 +685,67 @@ async def _handle_group_call_event(
         if existing is not None:
             await connection_manager.send_to_user(sender_id, {"type": "call.error", "message": "Call id is already in use"})
             return
+        upgrade_from_call_id = data.get("upgrade_from_call_id")
+        is_direct_upgrade = False
+        if upgrade_from_call_id is not None:
+            try:
+                upgrade_from_call_id = str(uuid.UUID(str(upgrade_from_call_id)))
+            except (ValueError, TypeError, AttributeError):
+                await connection_manager.send_to_user(sender_id, {"type": "call.error", "message": "Invalid call upgrade"})
+                return
+            direct_call = db.get(CallLog, upgrade_from_call_id)
+            is_direct_upgrade = bool(
+                direct_call
+                and direct_call.status == "active"
+                and sender_id in {direct_call.caller_id, direct_call.callee_id}
+                and direct_call.media_type == ("video" if data.get("media_type") == "video" else "audio")
+                and {direct_call.caller_id, direct_call.callee_id}.issubset(conversation_participants)
+            )
+            if not is_direct_upgrade:
+                await connection_manager.send_to_user(sender_id, {"type": "call.error", "message": "The active direct call could not be upgraded"})
+                return
         session = GroupCallLog(
             call_id=call_id,
             conversation_id=conversation_id,
             caller_id=sender_id,
             media_type="video" if data.get("media_type") == "video" else "audio",
-            status="ringing",
-            participant_ids=[sender_id],
-            invited_user_ids=recipients,
+            status="active" if is_direct_upgrade else "ringing",
+            participant_ids=(
+                [sender_id, direct_call.caller_id if direct_call.callee_id == sender_id else direct_call.callee_id]
+                if is_direct_upgrade else [sender_id]
+            ),
+            invited_user_ids=(
+                [user_id for user_id in recipients if user_id not in {sender_id, direct_call.caller_id, direct_call.callee_id}]
+                if is_direct_upgrade else recipients
+            ),
         )
         db.add(session)
         db.commit()
 
         conversation = db.get(Conversation, conversation_id)
         delivered = 0
-        for user_id in recipients:
-            if await connection_manager.send_to_user(user_id, {
-                "type": "call.incoming",
-                "call_id": call_id,
-                "conversation_id": conversation_id,
-                "from_user_id": sender_id,
-                "from_name": sender_name,
-                "from_avatar_url": sender.avatar_url,
-                "media_type": session.media_type,
-                "is_group": True,
-                "group_name": conversation.name if conversation else "Group call",
-            }):
-                delivered += 1
+        # For direct-call upgrades, wait until the existing peer is moved
+        # into the group session before ringing newly selected members.
+        if not is_direct_upgrade:
+            for user_id in recipients:
+                if await connection_manager.send_to_user(user_id, {
+                    "type": "call.incoming",
+                    "call_id": call_id,
+                    "conversation_id": conversation_id,
+                    "from_user_id": sender_id,
+                    "from_name": sender_name,
+                    "from_avatar_url": sender.avatar_url,
+                    "media_type": session.media_type,
+                    "is_group": True,
+                    "group_name": conversation.name if conversation else "Group call",
+                }):
+                    delivered += 1
         if delivered:
             await connection_manager.send_to_user(sender_id, {
                 "type": "call.ringing", "call_id": call_id, "conversation_id": conversation_id,
                 "media_type": session.media_type, "is_group": True,
             })
-        else:
+        elif not is_direct_upgrade:
             session.status = "missed"
             session.ended_at = datetime.now(timezone.utc)
             db.commit()
@@ -590,6 +762,52 @@ async def _handle_group_call_event(
         await connection_manager.send_to_user(sender_id, {"type": "call.error", "message": "Invalid group call recipient"})
         return
     session = db.get(GroupCallLog, call_id)
+    if session is None and event_type == "call.reinvite":
+        # Recover a live client-side group call whose first handoff event was
+        # missed by the server. All supplied participants must be actual group
+        # members; this lets the call continue and ring the requested member.
+        active_ids = data.get("active_participant_ids")
+        if (
+            isinstance(active_ids, list)
+            and 2 <= len(active_ids) <= 9
+            and all(type(user_id) is int for user_id in active_ids)
+            and len(set(active_ids)) == len(active_ids)
+            and sender_id in active_ids
+            and target_id not in active_ids
+            and set(active_ids).issubset(conversation_participants)
+        ):
+            media_type = "video" if data.get("media_type") == "video" else "audio"
+            session = GroupCallLog(
+                call_id=call_id,
+                conversation_id=conversation_id,
+                caller_id=sender_id,
+                media_type=media_type,
+                status="active",
+                participant_ids=active_ids,
+                invited_user_ids=[target_id],
+            )
+            db.add(session)
+            db.commit()
+            group = db.get(Conversation, conversation_id)
+            participant_info = []
+            for participant_id in active_ids:
+                participant = db.get(User, participant_id)
+                if participant:
+                    participant_info.append({
+                        "id": participant.id,
+                        "display_name": participant.display_name or participant.username or participant.phone or participant.email or "Signal user",
+                        "avatar_url": participant.avatar_url,
+                    })
+            state_event = {
+                "type": "call.group_state", "active": True,
+                "call_id": call_id, "conversation_id": conversation_id,
+                "caller_id": sender_id,
+                "group_name": group.name if group else "Group call",
+                "media_type": media_type,
+                "participants": participant_info,
+            }
+            for member_id in conversation_participants:
+                await connection_manager.send_to_user(member_id, state_event)
     if session is None or session.conversation_id != conversation_id:
         await connection_manager.send_to_user(sender_id, {"type": "call.error", "message": "Group call session was not found"})
         return
@@ -598,6 +816,41 @@ async def _handle_group_call_event(
             await connection_manager.send_to_user(sender_id, {"type": "call.error", "message": "You were not invited to this call"})
             return
     if session.status in {"completed", "missed", "declined", "cancelled"}:
+        return
+
+    if event_type == "call.reinvite":
+        if session.status != "active" or sender_id not in session.participant_ids or target_id in session.participant_ids:
+            return
+        if len(session.participant_ids) >= 9:
+            await connection_manager.send_to_user(sender_id, {
+                "type": "call.reinvite_failed", "call_id": call_id,
+                "conversation_id": conversation_id, "to_user_id": target_id,
+                "message": "This call is full",
+            })
+            return
+        if target_id not in session.invited_user_ids:
+            session.invited_user_ids = [*session.invited_user_ids, target_id]
+            db.commit()
+        conversation = db.get(Conversation, conversation_id)
+        target_user = db.get(User, target_id)
+        if not await connection_manager.send_to_user(target_id, {
+            "type": "call.incoming", "call_id": call_id,
+            "conversation_id": conversation_id, "from_user_id": sender_id,
+            "from_name": sender_name, "from_avatar_url": sender.avatar_url,
+            "media_type": session.media_type, "is_group": True,
+            "group_name": conversation.name if conversation else "Group call",
+            "caller_id": session.caller_id,
+        }):
+            await connection_manager.send_to_user(sender_id, {
+                "type": "call.reinvite_failed", "call_id": call_id,
+                "conversation_id": conversation_id, "to_user_id": target_id,
+                "message": f"{target_user.display_name if target_user else 'Member'} is offline",
+            })
+        else:
+            await connection_manager.send_to_user(sender_id, {
+                "type": "call.reinvite_sent", "call_id": call_id,
+                "conversation_id": conversation_id, "to_user_id": target_id,
+            })
         return
 
     peer_events = {"call.offer", "call.answer", "call.ice", "call.camera"}
@@ -670,10 +923,13 @@ async def _handle_group_call_event(
         return
 
     if event_type == "call.reject":
-        await connection_manager.send_to_user(session.caller_id, {
-            "type": "call.rejected", "call_id": call_id,
-            "conversation_id": conversation_id, "from_user_id": sender_id,
-        })
+        for participant_id in session.participant_ids:
+            if participant_id != sender_id:
+                await connection_manager.send_to_user(participant_id, {
+                    "type": "call.rejected", "call_id": call_id,
+                    "conversation_id": conversation_id, "from_user_id": sender_id,
+                    "from_name": sender_name,
+                })
         return
 
     if event_type == "call.cancel" and sender_id == session.caller_id:

@@ -23,3 +23,5 @@ node_modules/
 
 # Task spec — supervisor-managed, not part of the source
 task.md
+
+.env.production
